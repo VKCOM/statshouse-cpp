@@ -95,10 +95,16 @@ public:
 		bool write_values(const double *values, size_t values_count, double count = 0, uint32_t tsUnixSec = 0) {
 			return transport.write_values_impl(metric, tags, tags_count, values, values_count, count, tsUnixSec);
 		}
+		bool write_value(double value, uint32_t tsUnixSec = 0) {
+			return write_values(&value, 1, 0, tsUnixSec);
+		}
 		// for write_unique, set count to # of events before sampling, values to sample of original hashes
 		// for example, if you recorded events [1,1,1,1,2], you could pass them as is or as [1, 2] into 'values' and 5 into 'count'.
 		bool write_unique(const uint64_t *values, size_t values_count, double count, uint32_t tsUnixSec = 0) {
 			return transport.write_unique_impl(metric, tags, tags_count, values, values_count, count, tsUnixSec);
+		}
+		bool write_unique(uint64_t value, uint32_t tsUnixSec = 0) {
+			write_unique(&value, 1, 1, tsUnixSec);
 		}
 	private:
 		friend class TransportUDP;
