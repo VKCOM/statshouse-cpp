@@ -104,7 +104,7 @@ public:
 			return transport.write_unique_impl(metric, tags, tags_count, values, values_count, count, tsUnixSec);
 		}
 		bool write_unique(uint64_t value, uint32_t tsUnixSec = 0) {
-			write_unique(&value, 1, 1, tsUnixSec);
+			return write_unique(&value, 1, 1, tsUnixSec);
 		}
 	private:
 		friend class TransportUDP;
