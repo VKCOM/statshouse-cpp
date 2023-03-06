@@ -13,7 +13,7 @@
 
 // should compile without warnings with -Wno-noexcept-type -g -Wall -Wextra -Werror=return-type
 
-#define STATSHOUSE_TRANSPORT_VERSION "2022-11-24"
+#define STATSHOUSE_TRANSPORT_VERSION "2023-06-05"
 #define STATSHOUSE_USAGE_METRICS "statshouse_transport_metrics"
 
 #include <algorithm>
@@ -242,7 +242,6 @@ private:
 		TL_STATSHOUSE_METRIC_TS_FIELDS_MASK      = 1 << 4,
 		TL_STATSHOUSE_METRIC_VALUE_FIELDS_MASK   = 1 << 1,
 		TL_STATSHOUSE_METRIC_UNIQUE_FIELDS_MASK  = 1 << 2,
-		TL_STATSHOUSE_METRIC_NS_FIELDS_MASK      = 1 << 31, // new value semantic, will be removed after all libs are updated
 		BATCH_HEADER_LEN = TL_INT_SIZE * 3  // TL tag, fields_mask, # of batches
 	};
 	size_t batch_size = 0; // we fill packet header before sending
@@ -372,7 +371,6 @@ private:
 		if (STATSHOUSE_UNLIKELY(tsUnixSec != 0)) {
 			fields_mask |= TL_STATSHOUSE_METRIC_TS_FIELDS_MASK;
 		}
-		fields_mask |= TL_STATSHOUSE_METRIC_NS_FIELDS_MASK;
 		if (STATSHOUSE_UNLIKELY(!(begin = pack32(begin, end, fields_mask))))                   { return nullptr; }
 		if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, metric.data, metric.size)))) { return nullptr; }
 
