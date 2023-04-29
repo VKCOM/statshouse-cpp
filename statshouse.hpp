@@ -13,13 +13,12 @@
 
 // should compile without warnings with -Wno-noexcept-type -g -Wall -Wextra -Werror=return-type
 
-#define STATSHOUSE_TRANSPORT_VERSION "2023-06-05"
+#define STATSHOUSE_TRANSPORT_VERSION "2023-04-23"
 #define STATSHOUSE_USAGE_METRICS "statshouse_transport_metrics"
 
 #include <algorithm>
 #include <chrono>
 #include <cstring>
-#include <initializer_list>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -52,48 +51,41 @@ public:
 		DEFAULT_DATAGRAM_SIZE = 1232,
 		MAX_DATAGRAM_SIZE     = 65507, // https://stackoverflow.com/questions/42609561/udp-maximum-packet-size/42610200
 		MAX_KEYS              = 16,
+		MAX_FULL_KEY_SIZE     = 1024, // roughly metric plus all tags
 	};
 
-	// Key builder. Use by calling transport.metric("").tag("tag1").tag("tag2").write_count(1);
-	// Do not store, use immediately, as it contains simple pointer to passed values
+	// Metric name builder. Use by calling transport.metric("metric").tag("tag1").tag("tag2").write_count(1);
+	// Contains reference to transport and must outlive it
 	class Metric {
 	public:
+		// Assigns next tag value, starting from 1
 		Metric & tag(stringview str) {
-			if (tags_count < MAX_KEYS*2) {
-				if (!kv) {
-					tags[tags_count] = transport.tag_names[tags_count/2]; tags_count++;
-				}
-				tags[tags_count++] = str; // cannot overshoot
-			}
-			return *this;
+			return tag_id(next_tag++, str);
 		}
-		Metric & tag(const char * data, size_t size) {
-			if (tags_count < MAX_KEYS*2) {
-				if (!kv) {
-					tags[tags_count] = transport.tag_names[tags_count/2]; tags_count++;
-				}
-				tags[tags_count++] = stringview{data, size}; // cannot overshoot
-			}
-			return *this;
-		}
-
+		// Sets env (tag 0)
 		Metric & env(stringview str) {
-			tags[1] = str;
-			return *this;
+			env_set = true;
+			return tag_id(0, str);
 		}
-		Metric & env(const char * data, size_t size) {
-			tags[1] = stringview{data, size};
+		// Assigns arbitrary tag value
+		Metric & tag(stringview key, stringview str) {
+			auto begin = buffer + buffer_pos;
+			auto end = buffer + MAX_FULL_KEY_SIZE;
+			if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, key.data, key.size)))) { did_not_fit = true; return *this; }
+			if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, str.data, str.size)))) { did_not_fit = true; return *this; }
+			buffer_pos = begin - buffer;
+			tags_count++;
 			return *this;
 		}
 
 		// for write_count. if writing with sample factor, set count to # of events before sampling
 		bool write_count(double count, uint32_t tsUnixSec = 0) {
-			return transport.write_count_impl(metric, tags, tags_count, count, tsUnixSec);
+			return transport.write_count_impl(*this, count, tsUnixSec);
 		}
 		// for write_values. set count to # of events before sampling, values to sample of original values
-		// if no sampling is performed, pass 0 (interperted as values_count) to count
+		// if no sampling is performed, pass 0 (interpreted as values_count) to count
 		bool write_values(const double *values, size_t values_count, double count = 0, uint32_t tsUnixSec = 0) {
-			return transport.write_values_impl(metric, tags, tags_count, values, values_count, count, tsUnixSec);
+			return transport.write_values_impl(*this, values, values_count, count, tsUnixSec);
 		}
 		bool write_value(double value, uint32_t tsUnixSec = 0) {
 			return write_values(&value, 1, 0, tsUnixSec);
@@ -101,22 +93,43 @@ public:
 		// for write_unique, set count to # of events before sampling, values to sample of original hashes
 		// for example, if you recorded events [1,1,1,1,2], you could pass them as is or as [1, 2] into 'values' and 5 into 'count'.
 		bool write_unique(const uint64_t *values, size_t values_count, double count, uint32_t tsUnixSec = 0) {
-			return transport.write_unique_impl(metric, tags, tags_count, values, values_count, count, tsUnixSec);
+			return transport.write_unique_impl(*this, values, values_count, count, tsUnixSec);
 		}
 		bool write_unique(uint64_t value, uint32_t tsUnixSec = 0) {
 			return write_unique(&value, 1, 1, tsUnixSec);
 		}
 	private:
+		stringview metric_name() const { return {buffer + 1, metric_name_len}; }  // see pack_string
+		size_t tags_count_pos()const { return (1 + metric_name_len + 3) & ~3; } // see pack_string
+
+		Metric & tag_id(size_t i, stringview str) {
+			auto begin = buffer + buffer_pos;
+			auto end = buffer + MAX_FULL_KEY_SIZE;
+			if (STATSHOUSE_UNLIKELY(i >= MAX_KEYS)) { did_not_fit = true; return *this; }
+			if (STATSHOUSE_UNLIKELY(!(begin = pack32(begin, end, transport.tag_names_tl[i]))))    { did_not_fit = true; return *this; }
+			if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, str.data, str.size)))) { did_not_fit = true; return *this; }
+			buffer_pos = begin - buffer;
+			tags_count++;
+			return *this;
+		}
+
 		friend class TransportUDP;
-		explicit Metric(TransportUDP & transport, stringview metric, stringview env, bool kv):transport(transport), kv(kv), metric(metric), tags_count(2) {
-			tags[0] = stringview{"0"};
-			tags[1] = env;
+		explicit Metric(TransportUDP & transport, stringview m):transport(transport), metric_name_len(m.size) {
+			static_assert(MAX_FULL_KEY_SIZE > 4 + TL_MAX_TINY_STRING_LEN + 4, "not enough space to not overflow in constructor");
+			auto begin = buffer + buffer_pos;
+			auto end = buffer + MAX_FULL_KEY_SIZE;
+			begin = pack_string(begin, end, m.data, m.size);
+			begin = pack32(begin, end, 0); // place for tags_count. Never updated in buffer and always stays 0,
+			buffer_pos = begin - buffer;
 		}
 		TransportUDP & transport;
-		bool kv = false;
-		stringview metric;
+		bool env_set = false; // so current default_env will be added in pack_header
+		bool did_not_fit = false;
+		size_t next_tag = 1;
 		size_t tags_count = 0;
-		stringview tags[MAX_KEYS*2]; // Uninitialized, due to performance considerations.
+		size_t metric_name_len = 0;
+		size_t buffer_pos = 0; // not ptr because we want safe copy
+		char buffer[MAX_FULL_KEY_SIZE]; // Uninitialized, due to performance considerations.
 	};
 
 	// no functions of this class throw
@@ -129,8 +142,8 @@ public:
 		if (!ip.empty() && port != 0) {
 			udp_socket = create_socket(ip, port);
 		}
-		while (tag_names.size() < MAX_KEYS) {
-			tag_names.push_back(std::to_string(tag_names.size())); // tag names are "0", "1", etc.
+		while (tag_names_tl.size() < MAX_KEYS) {
+			tag_names_tl.push_back(pack_key_name(tag_names_tl.size()));  // tag names are "0", "1", etc.
 		}
 	}
 	TransportUDP(const TransportUDP &) = delete;
@@ -141,16 +154,21 @@ public:
 	}
 	bool is_socket_valid() const { return udp_socket >= 0; }
 
-	void set_default_env(const std::string & env) { default_env = env; } // automatically sent as tag '0'
+	void set_default_env(const std::string & env) { // automatically sent as tag '0'
+		default_env = env; //.substr(0, TL_MAX_TINY_STRING_LEN);
 
-	// write_* functions treat tags as tag values only, names are assumed to be ['1', '2', ...]
-	// write_*_kv functions treat tags as list pairs of (tag name, tag value), like ['platform', 'android', '7', '123', ...]
-	// default_env is sent as 'tag0', to overwrite pass env != nullptr to the last parameter of write_* functions
-	Metric metric(stringview name) { return Metric(*this, name, default_env, false); }
-	Metric metric(const char * name, size_t size) { return Metric(*this, stringview{name, size}, default_env, false); }
+		char buffer[TL_MAX_TINY_STRING_LEN + 8]{}; // key name, env, padding
+		auto begin = buffer;
+		auto end = buffer + sizeof(buffer);
 
-	Metric metric_kv(stringview name) { return Metric(*this, name, default_env, true); }
-	Metric metric_kv(const char * name, size_t size) { return Metric(*this, stringview{name, size}, default_env, true); }
+		auto short_env = shorten(env);
+		begin = pack32(begin, end, pack_key_name(0));
+		begin = pack_string(begin, end, short_env.data, short_env.size);
+
+		default_env_tl_pair.assign(buffer, begin - buffer);
+	}
+
+	Metric metric(stringview name) { return Metric(*this, shorten(name)); }
 
 	// if true, will flush immediately, otherwise if hundreds milliseconds passed since previous flush
 	bool flush(bool force) {
@@ -209,7 +227,7 @@ public:
 		std::vector<uint64_t> uniques{1, 2, 3};
 		statshouse.metric("toy" ).tag("android").tag("uniques").env("staging").write_unique(uniques.data(), uniques.size(), 5, 1630000000);
 
-		statshouse.metric_kv("toy" ).tag("platform").tag("android").tag("2").tag("count_kv").write_count(1);
+		statshouse.metric("toy" ).tag("platform", "android").tag("2", "count_kv").write_count(1);
 
 		statshouse.write_usage_metrics("test_main", "toy");
 		return 0;
@@ -245,12 +263,13 @@ private:
 		BATCH_HEADER_LEN = TL_INT_SIZE * 3  // TL tag, fields_mask, # of batches
 	};
 	size_t batch_size = 0; // we fill packet header before sending
-	size_t packet_len = BATCH_HEADER_LEN;
+	size_t packet_len = BATCH_HEADER_LEN; // reserve space for metric batch header
 
 	using clock = std::chrono::steady_clock;
 	clock::time_point next_flush_ts;
-	std::vector<std::string> tag_names;
-	std::string default_env;
+	std::vector<uint32_t> tag_names_tl;
+	std::string default_env; // not used
+	std::string default_env_tl_pair; // "0", default_env in TL format to optimized writing
 	int udp_socket = -1;
 	bool benchmark = false;
 
@@ -299,6 +318,7 @@ private:
 		std::memcpy(&v64, &v, sizeof(v));
 		return v64;
 	}
+	static stringview shorten(stringview x) { return stringview{x.data, std::min<size_t>(x.size, TL_MAX_TINY_STRING_LEN)}; }
 	static size_t tlPadSize(size_t n) { return (-n) & 3; }
 //	Trim is VERY costly, 2x slowdown even when no actual trim performed. We do not want to punish good guys, and for bad guys
 //		we have 'err_header_too_big' usage meta metric
@@ -307,48 +327,53 @@ private:
 //			++str;
 //			--len;
 //		}
-//		if (STATSHOUSE_UNLIKELY(len > MAX_STRING_LEN)) {
-//			len = MAX_STRING_LEN;
-//		}
 //		return pack_string(begin, end, str, len);
 //	}
-	static char * pack_string(char * begin, const char * end, const char * str, size_t len) {
-		if (STATSHOUSE_UNLIKELY(len > TL_MAX_TINY_STRING_LEN)) {
-			if (STATSHOUSE_UNLIKELY(len > TL_BIG_STRING_LEN)) {
-				return nullptr;
-			}
-			auto fullLen = (4 + len + 3) & ~3;
-			if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, fullLen))) {
-				return nullptr;
-			}
-			put32(begin + fullLen - 4, 0); // padding first
-			put32(begin, (len << 8U) | TL_BIG_STRING_MARKER);
-			std::memcpy(begin+4, str, len);
-			begin += fullLen;
-		} else {
-			auto fullLen = (1 + len + 3) & ~3;
-			if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, fullLen))) {
-				return nullptr;
-			}
-			put32(begin + fullLen - 4, 0); // padding first
-			*begin = len; // or put32(p, len);
-			std::memcpy(begin+1, str, len);
-			begin += fullLen;
+	static uint32_t pack_key_name(size_t i) {
+		static_assert(MAX_KEYS <= 100, "key names up to 100 supported");
+		if (i < 10) {
+			return 1 | (uint32_t('0' + i) << 8);
 		}
+		return 2 | (uint32_t('0' + i/10) << 8) | (uint32_t('0' + i%10) << 16);
+	}
+	static char * pack_string(char * begin, const char * end, const char * str, size_t len) {
+//		We call shorten() on all outside strings, so can remove code path for long strings here
+//		if (STATSHOUSE_UNLIKELY(len > TL_MAX_TINY_STRING_LEN)) {
+//			if (STATSHOUSE_UNLIKELY(len > TL_BIG_STRING_LEN)) {
+//				return nullptr;
+//			}
+//			auto fullLen = (4 + len + 3) & ~3;
+//			if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, fullLen))) {
+//				return nullptr;
+//			}
+//			put32(begin + fullLen - 4, 0); // padding first
+//			put32(begin, (len << 8U) | TL_BIG_STRING_MARKER);
+//			std::memcpy(begin+4, str, len);
+//			begin += fullLen;
+//		} else {
+		auto fullLen = (1 + len + 3) & ~3;
+		if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, fullLen))) {
+			return nullptr;
+		}
+		put32(begin + fullLen - 4, 0); // padding first
+		*begin = len; // or put32(p, len);
+		std::memcpy(begin+1, str, len);
+		begin += fullLen;
+//		}
 		return begin;
 	}
-	char * pack_header(clock::time_point now, size_t min_space, stringview metric, const stringview * tags, size_t tags_count,
-					   double counter, uint32_t tsUnixSec, size_t fields_mask) {
-		if (STATSHOUSE_UNLIKELY(tags_count % 2 != 0)) {
+	char * pack_header(clock::time_point now, size_t min_space, const Metric & metric,
+						double counter, uint32_t tsUnixSec, size_t fields_mask) {
+		if (STATSHOUSE_UNLIKELY(metric.did_not_fit)) {
 			stats.last_error.clear(); // prevent allocations
-			stats.last_error.append("statshouse::TransportUDP write_*_kv function has odd number of elements in tags array for metric=");
-			stats.last_error.append(metric.as_string());
-			++stats.metrics_odd_kv;
+			stats.last_error.append("statshouse::TransportUDP header too big for metric=");
+			stats.last_error.append(metric.metric_name().as_string());
+			++stats.metrics_too_big;
 			return nullptr;
 		}
 		char * begin = packet + packet_len;
 		const char * end = packet + max_payload_size;
-		if ((begin = pack_header_impl(begin, end, metric, tags, tags_count, counter, tsUnixSec, fields_mask)) && enoughSpace(begin, end, min_space)) {
+		if ((begin = pack_header_impl(begin, end, metric, counter, tsUnixSec, fields_mask)) && enoughSpace(begin, end, min_space)) {
 			return begin;
 		}
 		if (packet_len != BATCH_HEADER_LEN) {
@@ -356,29 +381,31 @@ private:
 				return nullptr;
 			}
 			begin = packet + packet_len;
-			if ((begin = pack_header_impl(begin, end, metric, tags, tags_count, counter, tsUnixSec, fields_mask)) && enoughSpace(begin, end, min_space)) {
+			if ((begin = pack_header_impl(begin, end, metric, counter, tsUnixSec, fields_mask)) && enoughSpace(begin, end, min_space)) {
 				return begin;
 			}
 		}
 		stats.last_error.clear(); // prevent allocations
 		stats.last_error.append("statshouse::TransportUDP header too big for metric=");
-		stats.last_error.append(metric.as_string());
+		stats.last_error.append(metric.metric_name().as_string());
 		++stats.metrics_too_big;
 		return nullptr;
 	}
-	static char * pack_header_impl(char * begin, const char * end, const stringview & metric, const stringview * tags, size_t tags_count,
-							double counter, uint32_t tsUnixSec, size_t fields_mask) {
-		if (STATSHOUSE_UNLIKELY(tsUnixSec != 0)) {
+	char * pack_header_impl(char * begin, const char * end, const Metric & metric,
+									double counter, uint32_t tsUnixSec, size_t fields_mask) {
+		if (tsUnixSec != 0) {
 			fields_mask |= TL_STATSHOUSE_METRIC_TS_FIELDS_MASK;
 		}
-		if (STATSHOUSE_UNLIKELY(!(begin = pack32(begin, end, fields_mask))))                   { return nullptr; }
-		if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, metric.data, metric.size)))) { return nullptr; }
-
-		auto pair_count = tags_count / 2;
-		if (STATSHOUSE_UNLIKELY(!(begin = pack32(begin, end, pair_count))))               { return nullptr; }
-
-		for (size_t i = 0; i != pair_count*2; ++i) { // tags_count should be never odd here, but check is cheap
-			if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, tags[i].data, tags[i].size)))) { return nullptr; }
+		if (STATSHOUSE_UNLIKELY(!(begin = pack32(begin, end, fields_mask))))   { return nullptr; }
+		if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, metric.buffer_pos))) { return nullptr; }
+		std::memcpy(begin, metric.buffer, metric.buffer_pos);
+		const auto add_env = !metric.env_set && !default_env.empty();
+		put32(begin + metric.tags_count_pos(), add_env ? metric.tags_count + 1 : metric.tags_count);
+		begin += metric.buffer_pos;
+		if (add_env) {
+			if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, default_env_tl_pair.size()))) { return nullptr; }
+			std::memcpy(begin, default_env_tl_pair.data(), default_env_tl_pair.size());
+			begin += default_env_tl_pair.size();
 		}
 		if (fields_mask & TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK) {
 			if (STATSHOUSE_UNLIKELY(!(begin = pack64(begin, end, doubleBits(counter))))) { return nullptr;}
@@ -388,12 +415,12 @@ private:
 		}
 		return begin;
 	}
-	bool write_count_impl(stringview metric, const stringview * tags, size_t tags_count, double count, uint32_t tsUnixSec) {
+	bool write_count_impl(const Metric & metric, double count, uint32_t tsUnixSec) {
 		if (!is_socket_valid() && !benchmark) {  // dummy instance or connection error
 			return true;
 		}
 		auto now = now_or_0();
-		char * begin = pack_header(now, 0, metric, tags, tags_count, count, tsUnixSec, TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK);
+		char * begin = pack_header(now, 0, metric, count, tsUnixSec, TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK);
 		if (!begin) {
 			return false;  // did not fit into empty buffer
 		}
@@ -401,8 +428,7 @@ private:
 		++batch_size;
 		return maybe_flush(now);
 	}
-	bool write_values_impl(stringview metric, const stringview * tags, size_t tags_count,
-						   const double *values, size_t values_count, double count, uint32_t tsUnixSec) {
+	bool write_values_impl(const Metric & metric, const double *values, size_t values_count, double count, uint32_t tsUnixSec) {
 		if (!is_socket_valid() && !benchmark) {  // dummy instance or connection error
 			return true;
 		}
@@ -413,7 +439,7 @@ private:
 		auto now = now_or_0();
 		const char * end = packet + max_payload_size;
 		while (values_count != 0) {
-			char * begin = pack_header(now, TL_INT_SIZE + TL_DOUBLE_SIZE, metric, tags, tags_count, count, tsUnixSec, fields_mask);
+			char * begin = pack_header(now, TL_INT_SIZE + TL_DOUBLE_SIZE, metric, count, tsUnixSec, fields_mask);
 			if (!begin) {
 				return false;  // did not fit into empty buffer
 			}
@@ -430,8 +456,7 @@ private:
 		}
 		return maybe_flush(now);
 	}
-	bool write_unique_impl(stringview metric, const stringview * tags, size_t tags_count,
-						   const uint64_t *values, size_t values_count, double count, uint32_t tsUnixSec) {
+	bool write_unique_impl(const Metric & metric, const uint64_t *values, size_t values_count, double count, uint32_t tsUnixSec) {
 		if (!is_socket_valid() && !benchmark) {  // dummy instance or connection error
 			return true;
 		}
@@ -442,7 +467,7 @@ private:
 		auto now = now_or_0();
 		const char * end = packet + max_payload_size;
 		while (values_count != 0) {
-			char * begin = pack_header(now, TL_INT_SIZE + TL_LONG_SIZE, metric, tags, tags_count, count, tsUnixSec, fields_mask);
+			char * begin = pack_header(now, TL_INT_SIZE + TL_LONG_SIZE, metric, count, tsUnixSec, fields_mask);
 			if (!begin) {
 				return false;  // did not fit into empty buffer
 			}
@@ -463,13 +488,13 @@ private:
 		if (*value || send_if_0) {
 			auto count = double(*value);
 			*value = 0;
-			return metric_kv(STATSHOUSE_USAGE_METRICS)
-			    .tag("status").tag(status)
-			    .tag("project").tag(project)
-			    .tag("cluster").tag(cluster)
-			    .tag("protocol").tag("udp")
-			    .tag("language").tag("cpp")
-			    .tag("version").tag(STATSHOUSE_TRANSPORT_VERSION).write_count(count);
+			return metric(STATSHOUSE_USAGE_METRICS)
+			    .tag("status", status)
+			    .tag("project" ,project)
+			    .tag("cluster", cluster)
+			    .tag("protocol", "udp")
+			    .tag("language", "cpp")
+			    .tag("version", STATSHOUSE_TRANSPORT_VERSION).write_count(count);
 		}
 		return true;
 	}
