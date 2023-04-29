@@ -13,7 +13,7 @@
 
 // should compile without warnings with -Wno-noexcept-type -g -Wall -Wextra -Werror=return-type
 
-#define STATSHOUSE_TRANSPORT_VERSION "2023-04-23"
+#define STATSHOUSE_TRANSPORT_VERSION "2023-04-29"
 #define STATSHOUSE_USAGE_METRICS "statshouse_transport_metrics"
 
 #include <algorithm>
@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+// Use #ifdefs to include headers for various platforms here
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -35,7 +36,7 @@ struct stringview { // slightly different name to avoid stupid name clashes
     const char * data = nullptr;
     size_t size = 0;
 
-    stringview() {}
+    stringview() = default;
     stringview(const char * str):data(str), size(std::strlen(str)) {}
     stringview(const std::string & str):data(str.data()), size(str.size()) {}
     stringview(const char * data, size_t size):data(data), size(size) {}
@@ -43,7 +44,7 @@ struct stringview { // slightly different name to avoid stupid name clashes
     std::string as_string()const { return std::string{data, size}; }
 };
 
-class TransportUDP {
+class TransportUDPBase {
 public:
 	enum {
 		DEFAULT_PORT          = 13337,
@@ -113,8 +114,8 @@ public:
 			return *this;
 		}
 
-		friend class TransportUDP;
-		explicit Metric(TransportUDP & transport, stringview m):transport(transport), metric_name_len(m.size) {
+		friend class TransportUDPBase;
+		explicit Metric(TransportUDPBase & transport, stringview m):transport(transport), metric_name_len(m.size) {
 			static_assert(MAX_FULL_KEY_SIZE > 4 + TL_MAX_TINY_STRING_LEN + 4, "not enough space to not overflow in constructor");
 			auto begin = buffer + buffer_pos;
 			auto end = buffer + MAX_FULL_KEY_SIZE;
@@ -122,7 +123,7 @@ public:
 			begin = pack32(begin, end, 0); // place for tags_count. Never updated in buffer and always stays 0,
 			buffer_pos = begin - buffer;
 		}
-		TransportUDP & transport;
+		TransportUDPBase & transport;
 		bool env_set = false; // so current default_env will be added in pack_header
 		bool did_not_fit = false;
 		size_t next_tag = 1;
@@ -132,27 +133,12 @@ public:
 		char buffer[MAX_FULL_KEY_SIZE]; // Uninitialized, due to performance considerations.
 	};
 
-	// no functions of this class throw
-	// pass empty ip to use as dummy writer
-	// access last error and statistics with move_stats()
-	// all functions return false in case error happened, you can ignore them or write last error to log periodically
-	// in multithread environment use external lock to access this instance
-	TransportUDP():TransportUDP("127.0.0.1", DEFAULT_PORT) {}
-	TransportUDP(const std::string &ip, int port) {
-		if (!ip.empty() && port != 0) {
-			udp_socket = create_socket(ip, port);
-		}
+	explicit TransportUDPBase() {
 		while (tag_names_tl.size() < MAX_KEYS) {
 			tag_names_tl.push_back(pack_key_name(tag_names_tl.size()));  // tag names are "0", "1", etc.
 		}
 	}
-	TransportUDP(const TransportUDP &) = delete;
-	TransportUDP &operator=(const TransportUDP &) = delete;
-	~TransportUDP() {
-		(void)flush(true);  // errors do not matter here
-		(void)::close(udp_socket);
-	}
-	bool is_socket_valid() const { return udp_socket >= 0; }
+	virtual ~TransportUDPBase() = default;
 
 	void set_default_env(const std::string & env) { // automatically sent as tag '0'
 		default_env = env; //.substr(0, TL_MAX_TINY_STRING_LEN);
@@ -172,9 +158,6 @@ public:
 
 	// if true, will flush immediately, otherwise if hundreds milliseconds passed since previous flush
 	bool flush(bool force) {
-		if (!is_socket_valid()) {  // dummy instance or connection error
-			return true;
-		}
 		auto now = now_or_0();
 		return force ? flush_impl(now) : maybe_flush(now);
 	}
@@ -216,35 +199,8 @@ public:
 
 	static std::string version() { return STATSHOUSE_TRANSPORT_VERSION; }
 
-	static int test_main() {  // call from your main for testing
-		TransportUDP statshouse;
-
-		statshouse.set_default_env("production");
-
-		statshouse.metric("toy" ).tag("android").tag("count").write_count(7);
-		std::vector<double> values{1, 2, 3};
-		statshouse.metric("toy" ).tag("android").tag("values").write_values(values.data(), values.size(), 6);
-		std::vector<uint64_t> uniques{1, 2, 3};
-		statshouse.metric("toy" ).tag("android").tag("uniques").env("staging").write_unique(uniques.data(), uniques.size(), 5, 1630000000);
-
-		statshouse.metric("toy" ).tag("platform", "android").tag("2", "count_kv").write_count(1);
-
-		statshouse.write_usage_metrics("test_main", "toy");
-		return 0;
-	}
-	static size_t benchmark_pack_header(size_t total_size) {
-		TransportUDP tmp("", 0);
-		tmp.benchmark = true; // so there is no dummy optimization
-		tmp.set_default_env("production");
-		tmp.set_max_udp_packet_size(MAX_DATAGRAM_SIZE);
-		tmp.set_flush_clock(false);
-
-		while (tmp.stats.bytes_sent < total_size) {
-			tmp.metric("typical_metric_name").tag("tag1_name").tag("tag2_name").tag("tag4_name").tag(
-					"tag4_name").write_count(1);
-		}
-		return tmp.stats.metrics_sent;
-	}
+protected:
+	Stats stats; // allow implementations to update stats directly for simplicity
 private:
 	enum {
 		MAX_STRING_LEN                  = 128, // defined in statshouse/internal/format/format.go
@@ -270,14 +226,10 @@ private:
 	std::vector<uint32_t> tag_names_tl;
 	std::string default_env; // not used
 	std::string default_env_tl_pair; // "0", default_env in TL format to optimized writing
-	int udp_socket = -1;
-	bool benchmark = false;
 
 	size_t max_payload_size = DEFAULT_DATAGRAM_SIZE;
 	bool immediate_flush    = false;
 	bool flush_clock        = true;
-
-	Stats stats;
 
 	char packet[MAX_DATAGRAM_SIZE]{};  // zeroing is cheap, we are cautious
 
@@ -300,7 +252,7 @@ private:
 		buf[6] = char(val >> 48);
 		buf[7] = char(val >> 56);
 	}
-	static bool enoughSpace(char * begin, const char * end, size_t req) { return begin + req <= end; }
+	static bool enoughSpace(const char * begin, const char * end, size_t req) { return begin + req <= end; }
 	static char * pack32(char * begin, const char  * end, size_t v) {
 		if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, 4))) { return nullptr; }
 		put32(begin, uint32_t(v));
@@ -416,9 +368,6 @@ private:
 		return begin;
 	}
 	bool write_count_impl(const Metric & metric, double count, uint32_t tsUnixSec) {
-		if (!is_socket_valid() && !benchmark) {  // dummy instance or connection error
-			return true;
-		}
 		auto now = now_or_0();
 		char * begin = pack_header(now, 0, metric, count, tsUnixSec, TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK);
 		if (!begin) {
@@ -429,9 +378,6 @@ private:
 		return maybe_flush(now);
 	}
 	bool write_values_impl(const Metric & metric, const double *values, size_t values_count, double count, uint32_t tsUnixSec) {
-		if (!is_socket_valid() && !benchmark) {  // dummy instance or connection error
-			return true;
-		}
 		size_t fields_mask = TL_STATSHOUSE_METRIC_VALUE_FIELDS_MASK;
 		if (count != 0 && count != double(values_count)) {
 			fields_mask |= TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK;
@@ -457,9 +403,6 @@ private:
 		return maybe_flush(now);
 	}
 	bool write_unique_impl(const Metric & metric, const uint64_t *values, size_t values_count, double count, uint32_t tsUnixSec) {
-		if (!is_socket_valid() && !benchmark) {  // dummy instance or connection error
-			return true;
-		}
 		size_t fields_mask = TL_STATSHOUSE_METRIC_UNIQUE_FIELDS_MASK;
 		if (count != 0 && count != double(values_count)) {
 			fields_mask |= TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK;
@@ -498,14 +441,122 @@ private:
 		}
 		return true;
 	}
-	void set_errno_error(int err, const char *msg) {
-		stats.last_error.clear();  // prevent allocations
-		stats.last_error.append(msg);
-		stats.last_error.append(" errno=");
-		stats.last_error.append(std::to_string(err));
-		stats.last_error.append(", ");
-		stats.last_error.append(strerror(err));
+	bool maybe_flush(clock::time_point now) { return (!immediate_flush && now <= next_flush_ts) || flush_impl(now); }
+	virtual bool on_flush_packet(const char * data, size_t size, size_t batch_size) = 0;
+	bool flush_impl(clock::time_point now) {
+		if (batch_size == 0) {
+			return true;
+		}
+		put32(packet, TL_STATSHOUSE_METRICS_BATCH_TAG);
+		put32(packet + TL_INT_SIZE, 0);  // fields mask
+		put32(packet + 2*TL_INT_SIZE, uint32_t(batch_size));  // batch size
+
+		auto result = on_flush_packet(packet, packet_len, batch_size);
+		if (result) {
+			++stats.packets_sent;
+			stats.metrics_sent += batch_size;
+			stats.bytes_sent += packet_len;
+		} else {
+			++stats.packets_failed;
+			stats.metrics_failed += batch_size;
+		}
+
+		batch_size = 0;
+		packet_len = BATCH_HEADER_LEN;
+		next_flush_ts  = now + std::chrono::milliseconds(FLUSH_INTERVAL_MILLISECOND);
+
+		// we will lose usage metrics if packet with usage is discarded, but we are ok with that
+		return result;
 	}
+};
+
+// Use #ifdefs to customize for various platforms here
+class TransportUDP : public TransportUDPBase {
+public:
+	// no functions of this class throw
+	// pass empty ip to use as dummy writer
+	// access last error and statistics with move_stats()
+	// all functions return false in case error happened, you can ignore them or write last error to log periodically
+	// in multithread environment use external lock to access this instance
+	TransportUDP():TransportUDP("127.0.0.1", DEFAULT_PORT) {}
+	TransportUDP(const std::string &ip, int port): dummy_instance(ip.empty() || port == 0) {
+		if (!dummy_instance) {
+			udp_socket = create_socket(ip, port);
+		}
+	}
+	TransportUDP(const TransportUDP &) = delete;
+	TransportUDP &operator=(const TransportUDP &) = delete;
+	~TransportUDP() override {
+		(void)flush(true);  // errors do not matter here
+		(void)::close(udp_socket);
+	}
+	bool is_socket_valid() const { return udp_socket >= 0; }
+
+	static int test_main() {  // call from your main for testing
+		TransportUDP statshouse;
+
+		statshouse.set_default_env("production");
+
+		statshouse.metric("toy" ).tag("android").tag("count").write_count(7);
+		std::vector<double> values{1, 2, 3};
+		statshouse.metric("toy" ).tag("android").tag("values").write_values(values.data(), values.size(), 6);
+		std::vector<uint64_t> uniques{1, 2, 3};
+		statshouse.metric("toy" ).tag("android").tag("uniques").env("staging").write_unique(uniques.data(), uniques.size(), 5, 1630000000);
+
+		statshouse.metric("toy" ).tag("platform", "android").tag("2", "count_kv").write_count(1);
+
+		statshouse.write_usage_metrics("test_main", "toy");
+		return 0;
+	}
+	static size_t benchmark_pack_header(size_t total_size) {
+		TransportUDP tmp("", 0);
+		tmp.set_default_env("production");
+		tmp.set_max_udp_packet_size(MAX_DATAGRAM_SIZE);
+		tmp.set_flush_clock(false);
+
+		std::vector<std::string> dynamic_tags;
+		while(dynamic_tags.size() < 1000000) {
+			dynamic_tags.push_back("tag3" + std::to_string(dynamic_tags.size()));
+		}
+		size_t next_tag_value = 0;
+
+		while (tmp.stats.bytes_sent < total_size) {
+			// when all tags are static, this compiles into setting metric memory to fixed bytes corresponding to TL representation of strings
+			tmp.metric("typical_metric_name").tag("tag1_name").tag("tag2_name").tag(dynamic_tags[next_tag_value]).tag(
+					"tag4_name").write_count(1);
+			if (++next_tag_value >= dynamic_tags.size())
+				next_tag_value = 0;
+		}
+
+		return tmp.stats.metrics_sent;
+	}
+private:
+	int udp_socket = -1;
+	bool dummy_instance = false; // better than separate class, because can be set depending on config
+
+	bool on_flush_packet(const char * data, size_t size, size_t batch_size) override {
+		if (dummy_instance) {
+			return true;
+		}
+		if (!is_socket_valid()) { // we reported connection error after start
+			return false;
+		}
+
+		ssize_t result = ::sendto(udp_socket, data, size, MSG_DONTWAIT, nullptr, 0);
+
+		if (result >= 0) {
+			return true;
+		}
+		auto err = errno;
+		if (err == EAGAIN) { //  || err == EWOULDBLOCK
+			++stats.packets_overflow;
+			stats.metrics_overflow += batch_size;
+			return false;
+		}
+		set_errno_error(err, "statshouse::TransportUDP sendto() failed");
+		return false;
+	}
+
 	int create_socket(const std::string &ip, int port) {
 		if (port < 0 || port > 0xffff) {
 			stats.last_error = "statshouse::TransportUDP invalid port=" + std::to_string(port);
@@ -528,7 +579,7 @@ private:
 			char high_byte = 0;
 			std::memcpy(&high_byte, &ap4->sin_addr, 1); // this is correct, sin_addr in network byte order
 			if (high_byte == 0x7F) {
-				max_payload_size = MAX_DATAGRAM_SIZE;
+				set_max_udp_packet_size(MAX_DATAGRAM_SIZE);
 			}
 		} else {
 			stats.last_error = "statshouse::TransportUDP could not parse ip=" + ip;
@@ -546,38 +597,13 @@ private:
 		}
 		return sock;
 	}
-	bool maybe_flush(clock::time_point now) { return (!immediate_flush && now <= next_flush_ts) || flush_impl(now); }
-	bool flush_impl(clock::time_point now) {
-		if (batch_size == 0) {
-			return true;
-		}
-		const auto was_batch_size = batch_size;
-		put32(packet, TL_STATSHOUSE_METRICS_BATCH_TAG);
-		put32(packet + TL_INT_SIZE, 0);  // fields mask
-		put32(packet + 2*TL_INT_SIZE, uint32_t(batch_size));  // batch size
-
-		ssize_t result = benchmark ? ssize_t(packet_len) : ::sendto(udp_socket, packet, packet_len, MSG_DONTWAIT, nullptr, 0);
-
-		batch_size = 0;
-		packet_len = BATCH_HEADER_LEN;
-		next_flush_ts  = now + std::chrono::milliseconds(FLUSH_INTERVAL_MILLISECOND);
-		// we will lose usage metrics if packet with usage is discarded, but we are ok with that
-
-		if (result < 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				++stats.packets_overflow;
-				stats.metrics_overflow += was_batch_size;
-				return false;
-			}
-			set_errno_error(errno, "statshouse::TransportUDP sendto() failed");
-			++stats.packets_failed;
-			stats.metrics_failed += was_batch_size;
-			return false;
-		}
-		++stats.packets_sent;
-		stats.metrics_sent += was_batch_size;
-		stats.bytes_sent += size_t(result);
-		return true;
+	void set_errno_error(int err, const char *msg) {
+		stats.last_error.clear();  // prevent allocations
+		stats.last_error.append(msg);
+		stats.last_error.append(" errno=");
+		stats.last_error.append(std::to_string(err));
+		stats.last_error.append(", ");
+		stats.last_error.append(strerror(err));
 	}
 };
 
