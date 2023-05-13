@@ -20,6 +20,7 @@
 #include <array>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -54,8 +55,17 @@ public:
 
 #endif
 
+struct nop_mutex { // will select lock policy later
+	nop_mutex() noexcept = default;
+	~nop_mutex() = default;
+
+	void lock() {}
+	void unlock() {}
+};
+
 class TransportUDPBase {
 public:
+	using mutex = nop_mutex; // for now use in experiments
 	enum {
 		DEFAULT_PORT          = 13337,
 		SAFE_DATAGRAM_SIZE    = 508,   // https://stackoverflow.com/questions/1098897/what-is-the-largest-safe-udp-packet-size-on-the-internet
@@ -91,11 +101,13 @@ public:
 
 		// for write_count. if writing with sample factor, set count to # of events before sampling
 		bool write_count(double count, uint32_t tsUnixSec = 0) {
+			std::lock_guard<mutex> lo(transport.mu);
 			return transport.write_count_impl(*this, count, tsUnixSec);
 		}
 		// for write_values. set count to # of events before sampling, values to sample of original values
 		// if no sampling is performed, pass 0 (interpreted as values_count) to count
 		bool write_values(const double *values, size_t values_count, double count = 0, uint32_t tsUnixSec = 0) {
+			std::lock_guard<mutex> lo(transport.mu);
 			return transport.write_values_impl(*this, values, values_count, count, tsUnixSec);
 		}
 		bool write_value(double value, uint32_t tsUnixSec = 0) {
@@ -104,6 +116,7 @@ public:
 		// for write_unique, set count to # of events before sampling, values to sample of original hashes
 		// for example, if you recorded events [1,1,1,1,2], you could pass them as is or as [1, 2] into 'values' and 5 into 'count'.
 		bool write_unique(const uint64_t *values, size_t values_count, double count, uint32_t tsUnixSec = 0) {
+			std::lock_guard<mutex> lo(transport.mu);
 			return transport.write_unique_impl(*this, values, values_count, count, tsUnixSec);
 		}
 		bool write_unique(uint64_t value, uint32_t tsUnixSec = 0) {
@@ -150,6 +163,7 @@ public:
 	virtual ~TransportUDPBase() = default;
 
 	void set_default_env(const std::string & env) { // automatically sent as tag '0'
+		std::lock_guard<mutex> lo(mu);
 		default_env = env;
 		if (default_env.empty()) {
 			default_env_tl_pair.clear();
@@ -165,7 +179,10 @@ public:
 
 		default_env_tl_pair.resize(begin - &default_env_tl_pair[0]);
 	}
-	const std::string & get_default_env()const { return default_env; }
+	std::string get_default_env()const {
+		std::lock_guard<mutex> lo(mu);
+		return default_env;
+	}
 
 	MetricBuilder metric(string_view name) { return MetricBuilder(*this, name); }
 
@@ -173,6 +190,7 @@ public:
 	// there might be extended period, when no metrics are written, so it is recommended to
 	// call flush() 1-10 times per second so no metric will be stuck in a buffer for a long time.
 	void flush(bool force = false) {
+		std::lock_guard<mutex> lo(mu);
 		auto now = time_now();
 		if (force) {
 			flush_impl(now);
@@ -187,6 +205,7 @@ public:
 	// so every event is marked by exact timestamp it happened.
 	// If you decide to call set_external_time, do not call flush()
 	void set_external_time(uint32_t timestamp) {
+		std::lock_guard<mutex> lo(mu); // not perfect, make packet_ts atomic
 		if (STATSHOUSE_UNLIKELY(tick_external && timestamp == packet_ts)) { return; }
 		tick_external = true;
 		flush_impl(timestamp);
@@ -194,10 +213,17 @@ public:
 
 	// max packet size can be changed at any point in instance lifetime
 	// by default on localhost packet_size will be set to MAX_DATAGRAM_SIZE, otherwise to DEFAULT_DATAGRAM_SIZE
-	void set_max_udp_packet_size(size_t s) { max_payload_size = std::max<size_t>(SAFE_DATAGRAM_SIZE, std::min<size_t>(s, MAX_DATAGRAM_SIZE)); }
+	void set_max_udp_packet_size(size_t s) {
+		std::lock_guard<mutex> lo(mu);
+		max_payload_size = std::max<size_t>(SAFE_DATAGRAM_SIZE, std::min<size_t>(s, MAX_DATAGRAM_SIZE));
+	}
 
 	// If set, will flush packet after each metric. Slow and unnecessary. Only for testing.
-	void set_immediate_flush(bool f) { immediate_flush = f; }
+	void set_immediate_flush(bool f) {
+		std::lock_guard<mutex> lo(mu);
+		immediate_flush = f;
+		flush_impl(time_now());
+	}
 
 	struct Stats {
 		size_t metrics_sent     = 0;
@@ -211,14 +237,20 @@ public:
 		size_t bytes_sent       = 0;
 		std::string last_error;
 	};
-	const Stats & get_stats()const {
-		return stats;
+	Stats get_stats()const {
+		std::lock_guard<mutex> lo(mu);
+		Stats other = stats;
+		return other;
 	}
-	void cleat_stats() { stats = Stats{}; }
+	void clear_stats() {
+		std::lock_guard<mutex> lo(mu);
+		stats = Stats{};
+	}
 
 	// writes and clears per metric counters to meta metric STATSHOUSE_USAGE_METRICS
 	// status "ok" is written always, error statuses only if corresponding counter != 0
 	bool write_usage_metrics(string_view project, string_view cluster) {
+		std::lock_guard<mutex> lo(mu);
 		auto result = true;
 		result = write_usage_metric_impl(project, cluster, "ok",                     &stats.metrics_sent    , true ) && result;
 		result = write_usage_metric_impl(project, cluster, "err_sendto_would_block", &stats.metrics_overflow, false) && result;
@@ -234,7 +266,6 @@ protected:
 	Stats stats; // allow implementations to update stats directly for simplicity
 private:
 	enum {
-		MAX_STRING_LEN                  = 128, // defined in statshouse/internal/format/format.go
 		TL_INT_SIZE                     = 4,
 		TL_LONG_SIZE                    = 8,
 		TL_DOUBLE_SIZE                  = 8,
@@ -248,6 +279,7 @@ private:
 		TL_STATSHOUSE_METRIC_UNIQUE_FIELDS_MASK  = 1 << 2,
 		BATCH_HEADER_LEN = TL_INT_SIZE * 3  // TL tag, fields_mask, # of batches
 	};
+	mutable mutex mu;
 	size_t batch_size = 0; // we fill packet header before sending
 	size_t packet_len = BATCH_HEADER_LEN; // reserve space for metric batch header
 
@@ -486,13 +518,13 @@ private:
 		if (*value || send_if_0) {
 			auto count = double(*value);
 			*value = 0;
-			return metric(STATSHOUSE_USAGE_METRICS)
+			write_count_impl(metric(STATSHOUSE_USAGE_METRICS)
 			    .tag("status", status)
 			    .tag("project" ,project)
 			    .tag("cluster", cluster)
 			    .tag("protocol", "udp")
 			    .tag("language", "cpp")
-			    .tag("version", STATSHOUSE_TRANSPORT_VERSION).write_count(count);
+			    .tag("version", STATSHOUSE_TRANSPORT_VERSION), count, 0);
 		}
 		return true;
 	}
