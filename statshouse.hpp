@@ -13,13 +13,14 @@
 
 // should compile without warnings with -Wno-noexcept-type -g -Wall -Wextra -Werror=return-type
 
-#define STATSHOUSE_TRANSPORT_VERSION "2023-04-29"
+#define STATSHOUSE_TRANSPORT_VERSION "2023-05-13"
 #define STATSHOUSE_USAGE_METRICS "statshouse_transport_metrics"
 
 #include <algorithm>
-#include <chrono>
+#include <array>
 #include <cstring>
-#include <stdexcept>
+#include <ctime>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -32,20 +33,39 @@
 
 namespace statshouse {
 
-struct stringview { // slightly different name to avoid stupid name clashes
-    const char * data = nullptr;
-    size_t size = 0;
+#if __cplusplus >= 201703L
 
-    stringview() = default;
-    stringview(const char * str):data(str), size(std::strlen(str)) {}
-    stringview(const std::string & str):data(str.data()), size(str.size()) {}
-    stringview(const char * data, size_t size):data(data), size(size) {}
+using string_view = std::string_view;
 
-    std::string as_string()const { return std::string{data, size}; }
+#else
+
+class string_view {
+	const char * d = nullptr;
+	size_t s       = 0;
+public:
+	string_view() = default;
+	string_view(const char * str):d(str), s(std::strlen(str)) {}
+	string_view(const std::string & str):d(str.data()), s(str.size()) {}
+	string_view(const char * d, size_t s):d(d), s(s) {}
+
+	const char * data() const { return d; }
+	size_t size() const { return s; }
+	operator std::string()const { return std::string{d, s}; }
+};
+
+#endif
+
+struct nop_mutex { // will select lock policy later
+	nop_mutex() noexcept = default;
+	~nop_mutex() = default;
+
+	void lock() {}
+	void unlock() {}
 };
 
 class TransportUDPBase {
 public:
+	using mutex = nop_mutex; // for now use in experiments
 	enum {
 		DEFAULT_PORT          = 13337,
 		SAFE_DATAGRAM_SIZE    = 508,   // https://stackoverflow.com/questions/1098897/what-is-the-largest-safe-udp-packet-size-on-the-internet
@@ -57,23 +77,23 @@ public:
 
 	// Metric name builder. Use by calling transport.metric("metric").tag("tag1").tag("tag2").write_count(1);
 	// Contains reference to transport and must outlive it
-	class Metric {
+	class MetricBuilder {
 	public:
 		// Assigns next tag value, starting from 1
-		Metric & tag(stringview str) {
+		MetricBuilder & tag(string_view str) {
 			return tag_id(next_tag++, str);
 		}
-		// Sets env (tag 0)
-		Metric & env(stringview str) {
+		// Sets env (tag 0). If not set, transport's default_env will be used.
+		MetricBuilder & env(string_view str) {
 			env_set = true;
 			return tag_id(0, str);
 		}
-		// Assigns arbitrary tag value
-		Metric & tag(stringview key, stringview str) {
+		// Assigns arbitrary tag value by key name
+		MetricBuilder & tag(string_view key, string_view str) {
 			auto begin = buffer + buffer_pos;
 			auto end = buffer + MAX_FULL_KEY_SIZE;
-			if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, key.data, key.size)))) { did_not_fit = true; return *this; }
-			if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, str.data, str.size)))) { did_not_fit = true; return *this; }
+			if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, key.data(), key.size())))) { did_not_fit = true; return *this; }
+			if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, str.data(), str.size())))) { did_not_fit = true; return *this; }
 			buffer_pos = begin - buffer;
 			tags_count++;
 			return *this;
@@ -81,11 +101,13 @@ public:
 
 		// for write_count. if writing with sample factor, set count to # of events before sampling
 		bool write_count(double count, uint32_t tsUnixSec = 0) {
+			std::lock_guard<mutex> lo(transport.mu);
 			return transport.write_count_impl(*this, count, tsUnixSec);
 		}
 		// for write_values. set count to # of events before sampling, values to sample of original values
 		// if no sampling is performed, pass 0 (interpreted as values_count) to count
 		bool write_values(const double *values, size_t values_count, double count = 0, uint32_t tsUnixSec = 0) {
+			std::lock_guard<mutex> lo(transport.mu);
 			return transport.write_values_impl(*this, values, values_count, count, tsUnixSec);
 		}
 		bool write_value(double value, uint32_t tsUnixSec = 0) {
@@ -94,38 +116,42 @@ public:
 		// for write_unique, set count to # of events before sampling, values to sample of original hashes
 		// for example, if you recorded events [1,1,1,1,2], you could pass them as is or as [1, 2] into 'values' and 5 into 'count'.
 		bool write_unique(const uint64_t *values, size_t values_count, double count, uint32_t tsUnixSec = 0) {
+			std::lock_guard<mutex> lo(transport.mu);
 			return transport.write_unique_impl(*this, values, values_count, count, tsUnixSec);
 		}
 		bool write_unique(uint64_t value, uint32_t tsUnixSec = 0) {
 			return write_unique(&value, 1, 1, tsUnixSec);
 		}
 	private:
-		stringview metric_name() const { return {buffer + 1, metric_name_len}; }  // see pack_string
+		string_view metric_name() const { return {buffer + 1, metric_name_len}; }  // see pack_string
+		string_view full_key_name() const { return {buffer, buffer_pos}; }
 		size_t tags_count_pos()const { return (1 + metric_name_len + 3) & ~3; } // see pack_string
 
-		Metric & tag_id(size_t i, stringview str) {
+		MetricBuilder & tag_id(size_t i, string_view str) {
 			auto begin = buffer + buffer_pos;
 			auto end = buffer + MAX_FULL_KEY_SIZE;
-			if (STATSHOUSE_UNLIKELY(i >= MAX_KEYS)) { did_not_fit = true; return *this; }
-			if (STATSHOUSE_UNLIKELY(!(begin = pack32(begin, end, transport.tag_names_tl[i]))))    { did_not_fit = true; return *this; }
-			if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, str.data, str.size)))) { did_not_fit = true; return *this; }
+			if (STATSHOUSE_UNLIKELY(!(begin = pack32(begin, end, get_tag_name_tl(i)))))               { did_not_fit = true; return *this; }
+			if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, str.data(), str.size())))) { did_not_fit = true; return *this; }
 			buffer_pos = begin - buffer;
 			tags_count++;
 			return *this;
 		}
 
 		friend class TransportUDPBase;
-		explicit Metric(TransportUDPBase & transport, stringview m):transport(transport), metric_name_len(m.size) {
+		explicit MetricBuilder(TransportUDPBase & transport, string_view m):transport(transport) {
+			// to simplify layout in buffer, we ensure metric name is in short format
+			m = shorten(m);
+			metric_name_len = m.size();
 			static_assert(MAX_FULL_KEY_SIZE > 4 + TL_MAX_TINY_STRING_LEN + 4, "not enough space to not overflow in constructor");
 			auto begin = buffer + buffer_pos;
 			auto end = buffer + MAX_FULL_KEY_SIZE;
-			begin = pack_string(begin, end, m.data, m.size);
+			begin = pack_string(begin, end, m.data(), m.size());
 			begin = pack32(begin, end, 0); // place for tags_count. Never updated in buffer and always stays 0,
 			buffer_pos = begin - buffer;
 		}
 		TransportUDPBase & transport;
-		bool env_set = false; // so current default_env will be added in pack_header
-		bool did_not_fit = false;
+		bool env_set = false; // so current default_env will be added in pack_header even if set later.
+		bool did_not_fit = false; // we do not want any exceptions in writing metrics
 		size_t next_tag = 1;
 		size_t tags_count = 0;
 		size_t metric_name_len = 0;
@@ -133,40 +159,71 @@ public:
 		char buffer[MAX_FULL_KEY_SIZE]; // Uninitialized, due to performance considerations.
 	};
 
-	explicit TransportUDPBase() {
-		while (tag_names_tl.size() < MAX_KEYS) {
-			tag_names_tl.push_back(pack_key_name(tag_names_tl.size()));  // tag names are "0", "1", etc.
-		}
-	}
+	explicit TransportUDPBase() = default;
 	virtual ~TransportUDPBase() = default;
 
 	void set_default_env(const std::string & env) { // automatically sent as tag '0'
-		default_env = env; //.substr(0, TL_MAX_TINY_STRING_LEN);
+		std::lock_guard<mutex> lo(mu);
+		default_env = env;
+		if (default_env.empty()) {
+			default_env_tl_pair.clear();
+			return;
+		}
 
-		char buffer[TL_MAX_TINY_STRING_LEN + 8]{}; // key name, env, padding
-		auto begin = buffer;
-		auto end = buffer + sizeof(buffer);
+		default_env_tl_pair.resize(4 + default_env.size() + 4); // key name, env, padding
+		auto begin = &default_env_tl_pair[0];
+		auto end = begin + default_env_tl_pair.size();
 
-		auto short_env = shorten(env);
 		begin = pack32(begin, end, pack_key_name(0));
-		begin = pack_string(begin, end, short_env.data, short_env.size);
+		begin = pack_string(begin, end, default_env.data(), default_env.size());
 
-		default_env_tl_pair.assign(buffer, begin - buffer);
+		default_env_tl_pair.resize(begin - &default_env_tl_pair[0]);
+	}
+	std::string get_default_env()const {
+		std::lock_guard<mutex> lo(mu);
+		return default_env;
 	}
 
-	Metric metric(stringview name) { return Metric(*this, shorten(name)); }
+	MetricBuilder metric(string_view name) { return MetricBuilder(*this, name); }
 
-	// if true, will flush immediately, otherwise if hundreds milliseconds passed since previous flush
-	bool flush(bool force) {
-		auto now = now_or_0();
-		return force ? flush_impl(now) : maybe_flush(now);
+	// flush() is performed automatically every time write_* is called, but in most services
+	// there might be extended period, when no metrics are written, so it is recommended to
+	// call flush() 1-10 times per second so no metric will be stuck in a buffer for a long time.
+	void flush(bool force = false) {
+		std::lock_guard<mutex> lo(mu);
+		auto now = time_now();
+		if (force) {
+			flush_impl(now);
+		} else {
+			maybe_flush(now);
+		}
 	}
 
-	// settings can be changed at any point in instance lifetime with more or less sane behavior
-	void set_max_udp_packet_size(size_t s) { max_payload_size = std::max<size_t>(SAFE_DATAGRAM_SIZE, std::min<size_t>(s, MAX_DATAGRAM_SIZE)); }
-	void set_immediate_flush(bool f) { immediate_flush = f; }
-	// turn off to avoid calls to chrono::now() inside transport, but you are responsible for calling flush(true) every second
-	void set_flush_clock(bool f) { flush_clock = f; }
+	// if you call this function, transport will stop calling std::time() function forever (so will be slightly faster),
+	// but you promise to call set_external_time forever every time clock second changes.
+	// You can call it as often as you like, for example on each event loop invocation before calling user code,
+	// so every event is marked by exact timestamp it happened.
+	// If you decide to call set_external_time, do not call flush()
+	void set_external_time(uint32_t timestamp) {
+		std::lock_guard<mutex> lo(mu); // not perfect, make packet_ts atomic
+		if (STATSHOUSE_UNLIKELY(tick_external && timestamp == packet_ts)) { return; }
+		tick_external = true;
+		flush_impl(timestamp);
+	}
+
+	// max packet size can be changed at any point in instance lifetime
+	// by default on localhost packet_size will be set to MAX_DATAGRAM_SIZE, otherwise to DEFAULT_DATAGRAM_SIZE
+	void set_max_udp_packet_size(size_t s) {
+		std::lock_guard<mutex> lo(mu);
+		max_payload_size = std::max<size_t>(SAFE_DATAGRAM_SIZE, std::min<size_t>(s, MAX_DATAGRAM_SIZE));
+	}
+
+	// If set, will flush packet after each metric. Slow and unnecessary. Only for testing.
+	void set_immediate_flush(bool f) {
+		std::lock_guard<mutex> lo(mu);
+		immediate_flush = f;
+		flush_impl(time_now());
+	}
 
 	struct Stats {
 		size_t metrics_sent     = 0;
@@ -180,14 +237,20 @@ public:
 		size_t bytes_sent       = 0;
 		std::string last_error;
 	};
-	const Stats & get_stats()const {
-		return stats;
+	Stats get_stats()const {
+		std::lock_guard<mutex> lo(mu);
+		Stats other = stats;
+		return other;
 	}
-	void cleat_stats() { stats = Stats{}; }
+	void clear_stats() {
+		std::lock_guard<mutex> lo(mu);
+		stats = Stats{};
+	}
 
 	// writes and clears per metric counters to meta metric STATSHOUSE_USAGE_METRICS
 	// status "ok" is written always, error statuses only if corresponding counter != 0
-	bool write_usage_metrics(stringview project, stringview cluster) {
+	bool write_usage_metrics(string_view project, string_view cluster) {
+		std::lock_guard<mutex> lo(mu);
 		auto result = true;
 		result = write_usage_metric_impl(project, cluster, "ok",                     &stats.metrics_sent    , true ) && result;
 		result = write_usage_metric_impl(project, cluster, "err_sendto_would_block", &stats.metrics_overflow, false) && result;
@@ -203,8 +266,6 @@ protected:
 	Stats stats; // allow implementations to update stats directly for simplicity
 private:
 	enum {
-		MAX_STRING_LEN                  = 128, // defined in statshouse/internal/format/format.go
-		FLUSH_INTERVAL_MILLISECOND      = 400, // arbitrary, several # per second flush.
 		TL_INT_SIZE                     = 4,
 		TL_LONG_SIZE                    = 8,
 		TL_DOUBLE_SIZE                  = 8,
@@ -218,31 +279,32 @@ private:
 		TL_STATSHOUSE_METRIC_UNIQUE_FIELDS_MASK  = 1 << 2,
 		BATCH_HEADER_LEN = TL_INT_SIZE * 3  // TL tag, fields_mask, # of batches
 	};
+	mutable mutex mu;
 	size_t batch_size = 0; // we fill packet header before sending
 	size_t packet_len = BATCH_HEADER_LEN; // reserve space for metric batch header
 
-	using clock = std::chrono::steady_clock;
-	clock::time_point next_flush_ts;
-	std::vector<uint32_t> tag_names_tl;
-	std::string default_env; // not used
+	std::string default_env;
 	std::string default_env_tl_pair; // "0", default_env in TL format to optimized writing
 
 	size_t max_payload_size = DEFAULT_DATAGRAM_SIZE;
-	bool immediate_flush    = false;
-	bool flush_clock        = true;
+	bool immediate_flush = false;
+	bool tick_external   = false;
+	uint32_t packet_ts   = 0; // also serves as external clock
 
 	char packet[MAX_DATAGRAM_SIZE]{};  // zeroing is cheap, we are cautious
 
-	clock::time_point now_or_0() const {
-		return flush_clock ? clock::now() : clock::time_point{};
+	uint32_t time_now() const {
+		return tick_external ? packet_ts : static_cast<uint32_t>(std::time(nullptr));
 	}
 	static void put32(char *buf, uint32_t val) {  // optimized to mov by modern compiler
+//		std::memcpy(buf, &val, 4); // endian dependent, hence commented, code below is equally fast
 		buf[0] = char(val);
 		buf[1] = char(val >> 8);
 		buf[2] = char(val >> 16);
 		buf[3] = char(val >> 24);
 	}
 	static void put64(char *buf, uint64_t val) {  // optimized to mov by modern compiler
+//		std::memcpy(buf, &val, 8); // endian dependent, hence commented, code below is equally fast
 		buf[0] = char(val);
 		buf[1] = char(val >> 8);
 		buf[2] = char(val >> 16);
@@ -270,8 +332,7 @@ private:
 		std::memcpy(&v64, &v, sizeof(v));
 		return v64;
 	}
-	static stringview shorten(stringview x) { return stringview{x.data, std::min<size_t>(x.size, TL_MAX_TINY_STRING_LEN)}; }
-	static size_t tlPadSize(size_t n) { return (-n) & 3; }
+	static string_view shorten(string_view x) { return string_view{x.data(), std::min<size_t>(x.size(), TL_MAX_TINY_STRING_LEN)}; }
 //	Trim is VERY costly, 2x slowdown even when no actual trim performed. We do not want to punish good guys, and for bad guys
 //		we have 'err_header_too_big' usage meta metric
 //	static char * pack_string_trim(char * begin, const char * end, const char *str, size_t len) {
@@ -281,47 +342,72 @@ private:
 //		}
 //		return pack_string(begin, end, str, len);
 //	}
-	static uint32_t pack_key_name(size_t i) {
+	static constexpr uint32_t pack_key_name(size_t i) {
 		static_assert(MAX_KEYS <= 100, "key names up to 100 supported");
-		if (i < 10) {
-			return 1 | (uint32_t('0' + i) << 8);
-		}
-		return 2 | (uint32_t('0' + i/10) << 8) | (uint32_t('0' + i%10) << 16);
+		return (i < 10) ? (1 | (uint32_t('0' + i) << 8)) : (2 | (uint32_t('0' + i/10) << 8) | (uint32_t('0' + i%10) << 16));
+	}
+	static uint32_t get_tag_name_tl(size_t i) {
+		static constexpr std::array<uint32_t, MAX_KEYS + 1> names{
+				pack_key_name(0),
+				pack_key_name(1),
+				pack_key_name(2),
+				pack_key_name(3),
+				pack_key_name(4),
+				pack_key_name(5),
+				pack_key_name(6),
+				pack_key_name(7),
+				pack_key_name(8),
+				pack_key_name(9),
+				pack_key_name(10),
+				pack_key_name(11),
+				pack_key_name(12),
+				pack_key_name(13),
+				pack_key_name(14),
+				pack_key_name(15),
+				pack_key_name(16),
+				// we add extra key on purpose. statshouse will show receive error "tag 16 does not exist" if we overflow
+		};
+		static_assert(names[MAX_KEYS] != 0, "please add key names to array when increasing MAX_KEYS");
+		if (i > names.size())
+			return 0; // if even more tags added, we do not care, so empty string is good enough.
+		return names[i];
 	}
 	static char * pack_string(char * begin, const char * end, const char * str, size_t len) {
-//		We call shorten() on all outside strings, so can remove code path for long strings here
-//		if (STATSHOUSE_UNLIKELY(len > TL_MAX_TINY_STRING_LEN)) {
-//			if (STATSHOUSE_UNLIKELY(len > TL_BIG_STRING_LEN)) {
-//				return nullptr;
-//			}
-//			auto fullLen = (4 + len + 3) & ~3;
-//			if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, fullLen))) {
-//				return nullptr;
-//			}
-//			put32(begin + fullLen - 4, 0); // padding first
-//			put32(begin, (len << 8U) | TL_BIG_STRING_MARKER);
-//			std::memcpy(begin+4, str, len);
-//			begin += fullLen;
-//		} else {
-		auto fullLen = (1 + len + 3) & ~3;
-		if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, fullLen))) {
-			return nullptr;
+		if (STATSHOUSE_UNLIKELY(len > TL_MAX_TINY_STRING_LEN)) {
+			if (STATSHOUSE_UNLIKELY(len > TL_BIG_STRING_LEN)) {
+				len = TL_BIG_STRING_LEN;
+			}
+			auto fullLen = (4 + len + 3) & ~3;
+			if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, fullLen))) {
+				return nullptr;
+			}
+			put32(begin + fullLen - 4, 0); // padding first
+			put32(begin, (len << 8U) | TL_BIG_STRING_MARKER);
+			std::memcpy(begin+4, str, len);
+			begin += fullLen;
+		} else {
+			auto fullLen = (1 + len + 3) & ~3;
+			if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, fullLen))) {
+				return nullptr;
+			}
+			put32(begin + fullLen - 4, 0); // padding first
+			*begin = static_cast<char>(len); // or put32(p, len);
+			std::memcpy(begin+1, str, len);
+			begin += fullLen;
 		}
-		put32(begin + fullLen - 4, 0); // padding first
-		*begin = len; // or put32(p, len);
-		std::memcpy(begin+1, str, len);
-		begin += fullLen;
-//		}
 		return begin;
 	}
-	char * pack_header(clock::time_point now, size_t min_space, const Metric & metric,
+	char * pack_header(uint32_t now, size_t min_space, const MetricBuilder & metric,
 						double counter, uint32_t tsUnixSec, size_t fields_mask) {
 		if (STATSHOUSE_UNLIKELY(metric.did_not_fit)) {
 			stats.last_error.clear(); // prevent allocations
 			stats.last_error.append("statshouse::TransportUDP header too big for metric=");
-			stats.last_error.append(metric.metric_name().as_string());
+			stats.last_error.append(metric.metric_name());
 			++stats.metrics_too_big;
 			return nullptr;
+		}
+		if (tsUnixSec == 0) {
+			tsUnixSec = now;
 		}
 		char * begin = packet + packet_len;
 		const char * end = packet + max_payload_size;
@@ -329,9 +415,7 @@ private:
 			return begin;
 		}
 		if (packet_len != BATCH_HEADER_LEN) {
-			if (!flush_impl(now)) {
-				return nullptr;
-			}
+			flush_impl(now);
 			begin = packet + packet_len;
 			if ((begin = pack_header_impl(begin, end, metric, counter, tsUnixSec, fields_mask)) && enoughSpace(begin, end, min_space)) {
 				return begin;
@@ -339,11 +423,11 @@ private:
 		}
 		stats.last_error.clear(); // prevent allocations
 		stats.last_error.append("statshouse::TransportUDP header too big for metric=");
-		stats.last_error.append(metric.metric_name().as_string());
+		stats.last_error.append(metric.metric_name());
 		++stats.metrics_too_big;
 		return nullptr;
 	}
-	char * pack_header_impl(char * begin, const char * end, const Metric & metric,
+	char * pack_header_impl(char * begin, const char * end, const MetricBuilder & metric,
 									double counter, uint32_t tsUnixSec, size_t fields_mask) {
 		if (tsUnixSec != 0) {
 			fields_mask |= TL_STATSHOUSE_METRIC_TS_FIELDS_MASK;
@@ -351,8 +435,8 @@ private:
 		if (STATSHOUSE_UNLIKELY(!(begin = pack32(begin, end, fields_mask))))   { return nullptr; }
 		if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, metric.buffer_pos))) { return nullptr; }
 		std::memcpy(begin, metric.buffer, metric.buffer_pos);
-		const auto add_env = !metric.env_set && !default_env.empty();
-		put32(begin + metric.tags_count_pos(), add_env ? metric.tags_count + 1 : metric.tags_count);
+		const bool add_env = !metric.env_set && !default_env_tl_pair.empty();
+		put32(begin + metric.tags_count_pos(), metric.tags_count + int(add_env));
 		begin += metric.buffer_pos;
 		if (add_env) {
 			if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, default_env_tl_pair.size()))) { return nullptr; }
@@ -367,22 +451,23 @@ private:
 		}
 		return begin;
 	}
-	bool write_count_impl(const Metric & metric, double count, uint32_t tsUnixSec) {
-		auto now = now_or_0();
+	bool write_count_impl(const MetricBuilder & metric, double count, uint32_t tsUnixSec) {
+		auto now = time_now();
 		char * begin = pack_header(now, 0, metric, count, tsUnixSec, TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK);
 		if (!begin) {
 			return false;  // did not fit into empty buffer
 		}
 		packet_len = begin - packet;
 		++batch_size;
-		return maybe_flush(now);
+		maybe_flush(now);
+		return true;
 	}
-	bool write_values_impl(const Metric & metric, const double *values, size_t values_count, double count, uint32_t tsUnixSec) {
+	bool write_values_impl(const MetricBuilder & metric, const double *values, size_t values_count, double count, uint32_t tsUnixSec) {
 		size_t fields_mask = TL_STATSHOUSE_METRIC_VALUE_FIELDS_MASK;
 		if (count != 0 && count != double(values_count)) {
 			fields_mask |= TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK;
 		}
-		auto now = now_or_0();
+		auto now = time_now();
 		const char * end = packet + max_payload_size;
 		while (values_count != 0) {
 			char * begin = pack_header(now, TL_INT_SIZE + TL_DOUBLE_SIZE, metric, count, tsUnixSec, fields_mask);
@@ -400,14 +485,15 @@ private:
 			packet_len = begin + write_count*TL_DOUBLE_SIZE - packet;
 			++batch_size;
 		}
-		return maybe_flush(now);
+		maybe_flush(now);
+		return true;
 	}
-	bool write_unique_impl(const Metric & metric, const uint64_t *values, size_t values_count, double count, uint32_t tsUnixSec) {
+	bool write_unique_impl(const MetricBuilder & metric, const uint64_t *values, size_t values_count, double count, uint32_t tsUnixSec) {
 		size_t fields_mask = TL_STATSHOUSE_METRIC_UNIQUE_FIELDS_MASK;
 		if (count != 0 && count != double(values_count)) {
 			fields_mask |= TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK;
 		}
-		auto now = now_or_0();
+		auto now = time_now();
 		const char * end = packet + max_payload_size;
 		while (values_count != 0) {
 			char * begin = pack_header(now, TL_INT_SIZE + TL_LONG_SIZE, metric, count, tsUnixSec, fields_mask);
@@ -425,27 +511,33 @@ private:
 			packet_len = begin + write_count*TL_LONG_SIZE - packet;
 			++batch_size;
 		}
-		return maybe_flush(now);
+		maybe_flush(now);
+		return true;
 	}
-	bool write_usage_metric_impl(stringview project, stringview cluster, stringview status, size_t * value, bool send_if_0) {
+	bool write_usage_metric_impl(string_view project, string_view cluster, string_view status, size_t * value, bool send_if_0) {
 		if (*value || send_if_0) {
 			auto count = double(*value);
 			*value = 0;
-			return metric(STATSHOUSE_USAGE_METRICS)
+			write_count_impl(metric(STATSHOUSE_USAGE_METRICS)
 			    .tag("status", status)
 			    .tag("project" ,project)
 			    .tag("cluster", cluster)
 			    .tag("protocol", "udp")
 			    .tag("language", "cpp")
-			    .tag("version", STATSHOUSE_TRANSPORT_VERSION).write_count(count);
+			    .tag("version", STATSHOUSE_TRANSPORT_VERSION), count, 0);
 		}
 		return true;
 	}
-	bool maybe_flush(clock::time_point now) { return (!immediate_flush && now <= next_flush_ts) || flush_impl(now); }
+	void maybe_flush(uint32_t now) {
+		if (immediate_flush || now != packet_ts) {
+			flush_impl(now);
+		}
+	}
 	virtual bool on_flush_packet(const char * data, size_t size, size_t batch_size) = 0;
-	bool flush_impl(clock::time_point now) {
+	void flush_impl(uint32_t now) {
+		packet_ts = now;
 		if (batch_size == 0) {
-			return true;
+			return;
 		}
 		put32(packet, TL_STATSHOUSE_METRICS_BATCH_TAG);
 		put32(packet + TL_INT_SIZE, 0);  // fields mask
@@ -460,13 +552,9 @@ private:
 			++stats.packets_failed;
 			stats.metrics_failed += batch_size;
 		}
-
+		// we will lose usage metrics if packet with usage is discarded, but we are ok with that
 		batch_size = 0;
 		packet_len = BATCH_HEADER_LEN;
-		next_flush_ts  = now + std::chrono::milliseconds(FLUSH_INTERVAL_MILLISECOND);
-
-		// we will lose usage metrics if packet with usage is discarded, but we are ok with that
-		return result;
 	}
 };
 
@@ -487,7 +575,7 @@ public:
 	TransportUDP(const TransportUDP &) = delete;
 	TransportUDP &operator=(const TransportUDP &) = delete;
 	~TransportUDP() override {
-		(void)flush(true);  // errors do not matter here
+		flush(true);
 		(void)::close(udp_socket);
 	}
 	bool is_socket_valid() const { return udp_socket >= 0; }
@@ -512,7 +600,7 @@ public:
 		TransportUDP tmp("", 0);
 		tmp.set_default_env("production");
 		tmp.set_max_udp_packet_size(MAX_DATAGRAM_SIZE);
-		tmp.set_flush_clock(false);
+		tmp.set_external_time(std::time(nullptr));
 
 		std::vector<std::string> dynamic_tags;
 		while(dynamic_tags.size() < 1000000) {
