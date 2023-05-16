@@ -112,14 +112,14 @@ public:
 
 		// for write_count. if writing with sample factor, set count to # of events before sampling
 		bool write_count(double count, uint32_t tsUnixSec = 0) const {
-			std::lock_guard<mutex> lo(transport.mu);
-			return transport.write_count_impl(*this, count, tsUnixSec);
+			std::lock_guard<mutex> lo(transport->mu);
+			return transport->write_count_impl(*this, count, tsUnixSec);
 		}
 		// for write_values. set count to # of events before sampling, values to sample of original values
 		// if no sampling is performed, pass 0 (interpreted as values_count) to count
 		bool write_values(const double *values, size_t values_count, double count = 0, uint32_t tsUnixSec = 0) const {
-			std::lock_guard<mutex> lo(transport.mu);
-			return transport.write_values_impl(*this, values, values_count, count, tsUnixSec);
+			std::lock_guard<mutex> lo(transport->mu);
+			return transport->write_values_impl(*this, values, values_count, count, tsUnixSec);
 		}
 		bool write_value(double value, uint32_t tsUnixSec = 0) const {
 			return write_values(&value, 1, 0, tsUnixSec);
@@ -127,8 +127,8 @@ public:
 		// for write_unique, set count to # of events before sampling, values to sample of original hashes
 		// for example, if you recorded events [1,1,1,1,2], you could pass them as is or as [1, 2] into 'values' and 5 into 'count'.
 		bool write_unique(const uint64_t *values, size_t values_count, double count, uint32_t tsUnixSec = 0) const {
-			std::lock_guard<mutex> lo(transport.mu);
-			return transport.write_unique_impl(*this, values, values_count, count, tsUnixSec);
+			std::lock_guard<mutex> lo(transport->mu);
+			return transport->write_unique_impl(*this, values, values_count, count, tsUnixSec);
 		}
 		bool write_unique(uint64_t value, uint32_t tsUnixSec = 0) const {
 			return write_unique(&value, 1, 1, tsUnixSec);
@@ -150,7 +150,7 @@ public:
 
 		friend class Registry;
 		friend class TransportUDPBase;
-		explicit MetricBuilder(TransportUDPBase & transport, string_view m):transport(transport) {
+		explicit MetricBuilder(TransportUDPBase *transport, string_view m):transport(transport) {
 			// to simplify layout in buffer, we ensure metric name is in short format
 			m = shorten(m);
 			metric_name_len = m.size();
@@ -161,7 +161,7 @@ public:
 			begin = pack32(begin, end, 0); // place for tags_count. Never updated in buffer and always stays 0,
 			buffer_pos = begin - buffer;
 		}
-		TransportUDPBase & transport;
+		TransportUDPBase *transport;
 		bool env_set = false; // so current default_env will be added in pack_header even if set later.
 		bool did_not_fit = false; // we do not want any exceptions in writing metrics
 		size_t next_tag = 1;
@@ -196,7 +196,7 @@ public:
 		return default_env;
 	}
 
-	MetricBuilder metric(string_view name) { return MetricBuilder(*this, name); }
+	MetricBuilder metric(string_view name) { return MetricBuilder(this, name); }
 
 	// flush() is performed automatically every time write_* is called, but in most services
 	// there might be extended period, when no metrics are written, so it is recommended to
@@ -852,7 +852,7 @@ public:
 	public:
 		MetricBuilder(Registry *registry, string_view name)
 			: registry{registry}
-			, key{registry->transport, name} {
+			, key{&registry->transport, name} {
 		}
 		MetricBuilder &tag(string_view str) {
 			key.tag(str);
@@ -1082,7 +1082,7 @@ private:
 			return std::make_shared<bucket>(key, timestamp);
 		}
 		auto ptr = std::move(freelist.back());
-		std::memcpy(&ptr->key, &key, sizeof(TransportUDP::MetricBuilder));
+		ptr->key = key;
 		ptr->timestamp = timestamp;
 		freelist.pop_back();
 		return ptr;
