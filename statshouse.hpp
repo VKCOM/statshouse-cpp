@@ -947,7 +947,7 @@ public:
 			return std::thread(&Clock::run, this, registry);
 		}
 		void run(Registry *registry) {
-			for (uint32_t prev = 0; !stop;) {
+			while (!stop) {
 				auto atime = std::chrono::time_point_cast<std::chrono::seconds>(std::chrono::system_clock::now()) + std::chrono::seconds{1};
 				std::this_thread::sleep_until(atime);
 				if (stop) {
@@ -1016,23 +1016,25 @@ private:
 		size_t count = 0;
 		{
 			std::lock_guard<std::mutex> lock{mu};
-			for (auto it = queue.cbegin(); count < size && it != queue.cend() && (*it)->timestamp <= timestamp; ++it) {
+			for (; count < size && !queue.empty() && queue.front()->timestamp <= timestamp;) {
 				auto &ptr = queue.front();
+				auto keep = false;
 				{
 					std::lock_guard<std::mutex> bucket_lock{ptr->mu};
 					if (!ptr->value.empty()) {
 						buffer[count] = alloc_bucket(ptr->key, ptr->timestamp);
 						std::swap(buffer[count]->value, ptr->value);
 						++count;
+						keep = true;
 					}
 				}
 				// pop front
-				if (ptr.use_count() > 2) {
-					// there are clients holding bucket reference, move bucket back
+				if (keep || ptr.use_count() > 2) {
+					// either there are clients holding bucket reference
+					// or bucket was written recently, move bucket back
 					ptr->timestamp = time_now();
 					queue.push_back(std::move(ptr));
-					ptr = queue.back();
-					ptr->queue_ptr = &queue.back();
+					queue.back()->queue_ptr = &queue.back();
 				} else {
 					// removing bucket with non-zero "queue_ptr" implies removal from dictionary
 					if (ptr->queue_ptr) {

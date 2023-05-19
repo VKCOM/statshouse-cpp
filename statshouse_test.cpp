@@ -42,7 +42,7 @@ void benchmark_pack_header(size_t benchmark_size = 1024*1024*1024) {
     t.set_max_udp_packet_size(TransportUDP::MAX_DATAGRAM_SIZE);
     auto start = std::chrono::high_resolution_clock::now();
     for (size_t next_tag_value{0}; stats.bytes_sent < benchmark_size;) {
-        auto res = t.metric("typical_metric_name")
+        t.metric("typical_metric_name")
             .tag("tag1_name")
             .tag("tag2_name")
             .tag(dynamic_tags[next_tag_value])
@@ -101,13 +101,13 @@ void benchmark_write_value<Registry>() {
 template<typename T>
 void benchmark_worst_case() {
     std::vector<std::string> dynamic_tags;
-    dynamic_tags.reserve(1000000);
+    dynamic_tags.reserve(10000);
     for (auto n = dynamic_tags.capacity(); n; n--) {
         dynamic_tags.push_back(std::to_string(dynamic_tags.size()));
     }
     T t;
     auto begin = std::chrono::steady_clock::now();
-    for (auto i = 0; i < 100000; i++) {
+    for (auto i = 0; i < 10000; i++) {
         t.metric("malpinskiy_investigation")
             .tag("9",  dynamic_tags[(i+0)%dynamic_tags.size()])
             .tag("10", dynamic_tags[(i+1)%dynamic_tags.size()])
@@ -123,29 +123,80 @@ void benchmark_worst_case() {
     std::printf("%s elapsed %ld milliseconds\n", traits<T>::get_name(), std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count());
 }
 
+template<>
+void benchmark_worst_case<Registry>() {
+    std::vector<std::string> dynamic_tags;
+    dynamic_tags.reserve(10000);
+    for (auto n = dynamic_tags.capacity(); n; n--) {
+        dynamic_tags.push_back(std::to_string(dynamic_tags.size()));
+    }
+    Registry t;
+    Registry::Clock c{&t};
+    auto begin = std::chrono::steady_clock::now();
+    for (auto i = 0; i < 10000; i++) {
+        t.metric("malpinskiy_investigation")
+            .tag("9",  dynamic_tags[(i+0)%dynamic_tags.size()])
+            .tag("10", dynamic_tags[(i+1)%dynamic_tags.size()])
+            .tag("11", dynamic_tags[(i+2)%dynamic_tags.size()])
+            .tag("12", dynamic_tags[(i+3)%dynamic_tags.size()])
+            .tag("13", dynamic_tags[(i+4)%dynamic_tags.size()])
+            .tag("14", dynamic_tags[(i+5)%dynamic_tags.size()])
+            .tag("15", dynamic_tags[(i+6)%dynamic_tags.size()])
+            .write_value(1);
+    }
+    t.flush();
+    auto end = std::chrono::steady_clock::now();
+    std::printf("Registry! elapsed %ld milliseconds\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count());
+}
+
 template<typename T>
 void benchmark_best_case() {
     std::vector<std::string> dynamic_tags;
-    dynamic_tags.reserve(100);
+    dynamic_tags.reserve(7);
     for (auto n = dynamic_tags.capacity(); n; n--) {
         dynamic_tags.push_back(std::to_string(dynamic_tags.size()));
     }
     T t;
     auto begin = std::chrono::steady_clock::now();
-    for (auto i = 0; i < 1000000; i++) {
+    for (auto i = 0; i < 10000000; i++) {
         t.metric("malpinskiy_investigation")
-            .tag("9",  dynamic_tags[0 % dynamic_tags.size()])
-            .tag("10", dynamic_tags[1 % dynamic_tags.size()])
-            .tag("11", dynamic_tags[2 % dynamic_tags.size()])
-            .tag("12", dynamic_tags[3 % dynamic_tags.size()])
-            .tag("13", dynamic_tags[4 % dynamic_tags.size()])
-            .tag("14", dynamic_tags[5 % dynamic_tags.size()])
-            .tag("15", dynamic_tags[6 % dynamic_tags.size()])
+            .tag("9",  dynamic_tags[0])
+            .tag("10", dynamic_tags[1])
+            .tag("11", dynamic_tags[2])
+            .tag("12", dynamic_tags[3])
+            .tag("13", dynamic_tags[4])
+            .tag("14", dynamic_tags[5])
+            .tag("15", dynamic_tags[6])
             .write_value(1);
     }
     t.flush();
     auto end = std::chrono::steady_clock::now();
     std::printf("%s elapsed %ld milliseconds\n", traits<T>::get_name(), std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count());
+}
+
+template<>
+void benchmark_best_case<Registry>() {
+    std::vector<std::string> dynamic_tags;
+    dynamic_tags.reserve(7);
+    for (auto n = dynamic_tags.capacity(); n; n--) {
+        dynamic_tags.push_back(std::to_string(dynamic_tags.size()));
+    }
+    Registry t;
+    auto begin = std::chrono::steady_clock::now();
+    auto m = t.metric("malpinskiy_investigation")
+        .tag("9",  dynamic_tags[0])
+        .tag("10", dynamic_tags[1])
+        .tag("11", dynamic_tags[2])
+        .tag("12", dynamic_tags[3])
+        .tag("13", dynamic_tags[4])
+        .tag("14", dynamic_tags[5])
+        .tag("15", dynamic_tags[6]);
+    for (auto i = 0; i < 10000000; i++) {
+        m.write_value(1);
+    }
+    t.flush();
+    auto end = std::chrono::steady_clock::now();
+    std::printf("Registry! elapsed %ld milliseconds\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count());
 }
 
 } // namespace test
@@ -156,8 +207,8 @@ int main() {
     // statshouse::test::benchmark_pack_header<statshouse::Registry>();
     // statshouse::test::benchmark_write_value<statshouse::TransportUDP>();
     // statshouse::test::benchmark_write_value<statshouse::Registry>();
-    // statshouse::test::benchmark_worst_case<statshouse::TransportUDP>();
     // statshouse::test::benchmark_worst_case<statshouse::Registry>();
+    // statshouse::test::benchmark_worst_case<statshouse::TransportUDP>();
     // statshouse::test::benchmark_best_case<statshouse::TransportUDP>();
     statshouse::test::benchmark_best_case<statshouse::Registry>();
 }
