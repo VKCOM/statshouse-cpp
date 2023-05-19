@@ -755,7 +755,7 @@ private:
 			, unique{unique} {
 		}
 		size_t empty() const {
-			return !count && !values_count;
+			return count == 0 && !values_count;
 		}
 		double count;
 		size_t values_count;
@@ -789,7 +789,7 @@ private:
 			src_count -= effective_count;
 		}
 		bool empty() const {
-			return !count && values.empty() && unique.empty();
+			return count == 0 && values.empty() && unique.empty();
 		}
 		double count{};
 		std::vector<double> values;
@@ -845,7 +845,7 @@ public:
 			return registry->update_multivalue_by_ref(ptr, value);
 		}
 	private:
-		mutable Registry *registry;
+		Registry *registry;
 		std::shared_ptr<bucket> ptr;
 	};
 	class MetricBuilder {
@@ -900,7 +900,7 @@ public:
 			return registry->update_multivalue_by_key(key, value);
 		}
 	private:
-		mutable Registry *registry;
+		Registry *registry;
 		TransportUDP::MetricBuilder key;
 	};
 	MetricBuilder metric(string_view name) {
@@ -1056,7 +1056,7 @@ private:
 					ptr->key.write_values(v.values.data(), v.values.size(), v.count, timestamp);
 				} else if (!v.unique.empty()) {
 					ptr->key.write_unique(v.unique.data(), v.unique.size(), v.count, timestamp);
-				} else if (v.count) {
+				} else if (v.count != 0) {
 					ptr->key.write_count(v.count, timestamp);
 				}
 				v.count = 0;
