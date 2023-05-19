@@ -732,7 +732,7 @@ public:
 	Registry &operator=(const Registry &other) = delete;
 	Registry &operator=(Registry &&other) = delete;
 	~Registry() {
-		flush();
+		flush(true);
 	}
 private:
 	struct multivalue_view {
@@ -914,8 +914,10 @@ public:
 	void disable_incremental_flush() {
 		incremental_flush_disabled = true;
 	}
-	void flush() {
-		if (incremental_flush_disabled) {
+	void flush(bool force = false) {
+		if (force) {
+			flush(time_now());
+		} else if (incremental_flush_disabled) {
 			flush(time_now() - 1);
 		} else {
 			flush(time_now() - 2);
