@@ -13,15 +13,21 @@
 
 // should compile without warnings with -Wno-noexcept-type -g -Wall -Wextra -Werror=return-type
 
-#define STATSHOUSE_TRANSPORT_VERSION "2023-05-13"
+#define STATSHOUSE_TRANSPORT_VERSION "2023-05-16"
 #define STATSHOUSE_USAGE_METRICS "statshouse_transport_metrics"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <ctime>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 // Use #ifdefs to include headers for various platforms here
@@ -30,6 +36,7 @@
 #include <unistd.h>
 
 #define STATSHOUSE_UNLIKELY(x) __builtin_expect((x), 0) // could improve packing performance on your platform. Set to (x) to disable
+#define STATSHOUSE_LIKELY(x)   __builtin_expect((x), 1)
 
 namespace statshouse {
 
@@ -63,7 +70,11 @@ struct nop_mutex { // will select lock policy later
 	void unlock() {}
 };
 
+namespace test { template<typename T> struct traits; }
+
 class TransportUDPBase {
+	friend class Registry;
+	template<typename T> friend struct test::traits;
 public:
 	using mutex = nop_mutex; // for now use in experiments
 	enum {
@@ -100,26 +111,26 @@ public:
 		}
 
 		// for write_count. if writing with sample factor, set count to # of events before sampling
-		bool write_count(double count, uint32_t tsUnixSec = 0) {
-			std::lock_guard<mutex> lo(transport.mu);
-			return transport.write_count_impl(*this, count, tsUnixSec);
+		bool write_count(double count, uint32_t tsUnixSec = 0) const {
+			std::lock_guard<mutex> lo(transport->mu);
+			return transport->write_count_impl(*this, count, tsUnixSec);
 		}
 		// for write_values. set count to # of events before sampling, values to sample of original values
 		// if no sampling is performed, pass 0 (interpreted as values_count) to count
-		bool write_values(const double *values, size_t values_count, double count = 0, uint32_t tsUnixSec = 0) {
-			std::lock_guard<mutex> lo(transport.mu);
-			return transport.write_values_impl(*this, values, values_count, count, tsUnixSec);
+		bool write_values(const double *values, size_t values_count, double count = 0, uint32_t tsUnixSec = 0) const {
+			std::lock_guard<mutex> lo(transport->mu);
+			return transport->write_values_impl(*this, values, values_count, count, tsUnixSec);
 		}
-		bool write_value(double value, uint32_t tsUnixSec = 0) {
+		bool write_value(double value, uint32_t tsUnixSec = 0) const {
 			return write_values(&value, 1, 0, tsUnixSec);
 		}
 		// for write_unique, set count to # of events before sampling, values to sample of original hashes
 		// for example, if you recorded events [1,1,1,1,2], you could pass them as is or as [1, 2] into 'values' and 5 into 'count'.
-		bool write_unique(const uint64_t *values, size_t values_count, double count, uint32_t tsUnixSec = 0) {
-			std::lock_guard<mutex> lo(transport.mu);
-			return transport.write_unique_impl(*this, values, values_count, count, tsUnixSec);
+		bool write_unique(const uint64_t *values, size_t values_count, double count, uint32_t tsUnixSec = 0) const {
+			std::lock_guard<mutex> lo(transport->mu);
+			return transport->write_unique_impl(*this, values, values_count, count, tsUnixSec);
 		}
-		bool write_unique(uint64_t value, uint32_t tsUnixSec = 0) {
+		bool write_unique(uint64_t value, uint32_t tsUnixSec = 0) const {
 			return write_unique(&value, 1, 1, tsUnixSec);
 		}
 	private:
@@ -137,8 +148,9 @@ public:
 			return *this;
 		}
 
+		friend class Registry;
 		friend class TransportUDPBase;
-		explicit MetricBuilder(TransportUDPBase & transport, string_view m):transport(transport) {
+		explicit MetricBuilder(TransportUDPBase *transport, string_view m):transport(transport) {
 			// to simplify layout in buffer, we ensure metric name is in short format
 			m = shorten(m);
 			metric_name_len = m.size();
@@ -149,7 +161,7 @@ public:
 			begin = pack32(begin, end, 0); // place for tags_count. Never updated in buffer and always stays 0,
 			buffer_pos = begin - buffer;
 		}
-		TransportUDPBase & transport;
+		TransportUDPBase *transport;
 		bool env_set = false; // so current default_env will be added in pack_header even if set later.
 		bool did_not_fit = false; // we do not want any exceptions in writing metrics
 		size_t next_tag = 1;
@@ -184,7 +196,7 @@ public:
 		return default_env;
 	}
 
-	MetricBuilder metric(string_view name) { return MetricBuilder(*this, name); }
+	MetricBuilder metric(string_view name) { return MetricBuilder(this, name); }
 
 	// flush() is performed automatically every time write_* is called, but in most services
 	// there might be extended period, when no metrics are written, so it is recommended to
@@ -560,6 +572,7 @@ private:
 
 // Use #ifdefs to customize for various platforms here
 class TransportUDP : public TransportUDPBase {
+	template<typename T> friend struct test::traits;
 public:
 	// no functions of this class throw
 	// pass empty ip to use as dummy writer
@@ -694,6 +707,477 @@ private:
 		stats.last_error.append(strerror(err));
 	}
 };
+
+uint64_t hash_bytes(const void *ptr, size_t len, uint64_t seed);
+
+class Registry {
+	template <typename T> friend struct test::traits;
+	enum {
+		DEFAULT_MAX_BUCKET_SIZE = 1024,
+		EXPLICIT_FLUSH_CHUNK_SIZE = 10,
+		INCREMENTAL_FLUSH_SIZE = 2,
+	};
+public:
+	Registry()
+		: Registry("127.0.0.1", TransportUDP::DEFAULT_PORT) {
+	}
+	Registry(const std::string &host, int port)
+		: max_bucket_size{DEFAULT_MAX_BUCKET_SIZE}
+		, time_external{0}
+		, incremental_flush_disabled{false}
+		, transport{host, port} {
+	}
+	Registry(const Registry &other) = delete;
+	Registry(Registry &&other) = delete;
+	Registry &operator=(const Registry &other) = delete;
+	Registry &operator=(Registry &&other) = delete;
+	~Registry() {
+		flush(true);
+	}
+private:
+	struct multivalue_view {
+		explicit multivalue_view(double count)
+			: count{count}
+			, values_count{0}
+			, values{nullptr}
+			, unique{nullptr} {
+		}
+		multivalue_view(double count, size_t values_count, const double *values)
+			: count{std::max(count, static_cast<double>(values_count))}
+			, values_count{values_count}
+			, values{values}
+			, unique{nullptr} {
+		}
+		multivalue_view(double count, size_t values_count, const uint64_t *unique)
+			: count{std::max(count, static_cast<double>(values_count))}
+			, values_count{values_count}
+			, values{nullptr}
+			, unique{unique} {
+		}
+		size_t empty() const {
+			return count == 0 && !values_count;
+		}
+		double count;
+		size_t values_count;
+		const double *values;
+		const uint64_t *unique;
+	};
+	struct multivalue {
+		void write(multivalue_view &src, size_t limit) {
+			if (src.values) {
+				write(values, src.values, src.values_count, src.count, limit);
+			} else if (src.unique) {
+				write(unique, src.unique, src.values_count, src.count, limit);
+			} else {
+				count += src.count;
+				src.count = 0;
+			}
+		}
+		template <typename T>
+		void write(std::vector<T> &dst, const T *src, size_t &src_size, double &src_count, size_t limit) {
+			if (!src_size || limit <= dst.size()) {
+				return;
+			}
+			// limit size & count
+			auto effective_size = std::min(src_size, limit - dst.size());
+			auto effective_count = (effective_size / src_size) * src_count;
+			// update this
+			dst.insert(dst.end(), src, src + effective_size);
+			count += effective_count;
+			// update arguments
+			src_size -= effective_size;
+			src_count -= effective_count;
+		}
+		bool empty() const {
+			return count == 0 && values.empty() && unique.empty();
+		}
+		double count{};
+		std::vector<double> values;
+		std::vector<uint64_t> unique;
+	};
+	struct bucket {
+		bucket(const TransportUDP::MetricBuilder &key, uint32_t timestamp)
+			: key{key}
+			, timestamp{timestamp}
+			, queue_ptr{nullptr} {
+		}
+		TransportUDP::MetricBuilder key;
+		uint32_t timestamp;
+		multivalue value;
+		std::mutex mu;
+		std::shared_ptr<bucket> *queue_ptr;
+	};
+public:
+	class MetricRef {
+	public:
+		MetricRef(Registry *registry, const TransportUDP::MetricBuilder &key)
+			: registry{registry}
+			, ptr{registry->get_or_create_bucket(key)} {
+		}
+		bool write_count(double count, uint32_t timestamp = 0) const {
+			if (timestamp) {
+				std::lock_guard<std::mutex> transport_lock{registry->transport_mu};
+				return ptr->key.write_count(count, timestamp);
+			}
+			multivalue_view value{count};
+			return registry->update_multivalue_by_ref(ptr, value);
+		}
+		bool write_value(double value, uint32_t timestamp = 0) const {
+			return write_values(&value, 1, 1, timestamp);
+		}
+		bool write_values(const double *values, size_t values_count, double count = 0, uint32_t timestamp = 0) const {
+			if (timestamp || values_count >= registry->max_bucket_size.load(std::memory_order_relaxed)) {
+				std::lock_guard<std::mutex> transport_lock{registry->transport_mu};
+				return ptr->key.write_values(values, values_count, count, timestamp);
+			}
+			multivalue_view value{count, values_count, values};
+			return registry->update_multivalue_by_ref(ptr, value);
+		}
+		bool write_unique(uint64_t value, uint32_t timestamp = 0) const {
+			return write_unique(&value, 1, 1, timestamp);
+		}
+		bool write_unique(const uint64_t *values, size_t values_count, double count, uint32_t timestamp = 0) const {
+			if (timestamp || values_count >= registry->max_bucket_size.load(std::memory_order_relaxed)) {
+				std::lock_guard<std::mutex> transport_lock{registry->transport_mu};
+				return ptr->key.write_unique(values, values_count, count, timestamp);
+			}
+			multivalue_view value{count, values_count, values};
+			return registry->update_multivalue_by_ref(ptr, value);
+		}
+	private:
+		Registry *registry;
+		std::shared_ptr<bucket> ptr;
+	};
+	class MetricBuilder {
+	public:
+		MetricBuilder(Registry *registry, string_view name)
+			: registry{registry}
+			, key{&registry->transport, name} {
+		}
+		MetricBuilder &tag(string_view str) {
+			key.tag(str);
+			return *this;
+		}
+		MetricBuilder &env(string_view str) {
+			key.env(str);
+			return *this;
+		}
+		MetricBuilder &tag(string_view a, string_view b) {
+			key.tag(a, b);
+			return *this;
+		}
+		MetricRef ref() const {
+			return MetricRef{registry, key};
+		}
+		bool write_count(double count, uint32_t timestamp = 0) const {
+			if (timestamp) {
+				std::lock_guard<std::mutex> transport_lock{registry->transport_mu};
+				return key.write_count(count, timestamp);
+			}
+			multivalue_view value{count};
+			return registry->update_multivalue_by_key(key, value);
+		}
+		bool write_value(double value, uint32_t timestamp = 0) const {
+			return write_values(&value, 1, 1, timestamp);
+		}
+		bool write_values(const double *values, size_t values_count, double count = 0, uint32_t timestamp = 0) const {
+			if (timestamp || values_count >= registry->max_bucket_size.load(std::memory_order_relaxed)) {
+				std::lock_guard<std::mutex> transport_lock{registry->transport_mu};
+				return key.write_values(values, values_count, count, timestamp);
+			}
+			multivalue_view value{count, values_count, values};
+			return registry->update_multivalue_by_key(key, value);
+		}
+		bool write_unique(uint64_t value, uint32_t timestamp = 0) const {
+			return write_unique(&value, 1, 1, timestamp);
+		}
+		bool write_unique(const uint64_t *values, size_t values_count, double count, uint32_t timestamp = 0) const {
+			if (timestamp || values_count >= registry->max_bucket_size.load(std::memory_order_relaxed)) {
+				std::lock_guard<std::mutex> transport_lock{registry->transport_mu};
+				return key.write_unique(values, values_count, count, timestamp);
+			}
+			multivalue_view value{count, values_count, values};
+			return registry->update_multivalue_by_key(key, value);
+		}
+	private:
+		Registry *registry;
+		TransportUDP::MetricBuilder key;
+	};
+	MetricBuilder metric(string_view name) {
+		return {this, name};
+	}
+	// If called once, then you need to call it until the end of the life of the registry.
+	void set_external_time(uint32_t timestamp) {
+		time_external = timestamp;
+	}
+	// Call once during initialization, if set then you are responsible for calling "flush".
+	void disable_incremental_flush() {
+		incremental_flush_disabled = true;
+	}
+	void flush(bool force = false) {
+		if (force) {
+			flush(time_now());
+		} else if (incremental_flush_disabled) {
+			flush(time_now() - 1);
+		} else {
+			flush(time_now() - 2);
+		}
+	}
+	void set_max_udp_packet_size(size_t n) {
+		std::lock_guard<std::mutex> transport_lock{transport_mu};
+		transport.set_max_udp_packet_size(n);
+	}
+	void set_max_bucket_size(size_t n) {
+		max_bucket_size.store(n, std::memory_order_relaxed);
+	}
+	void set_default_env(const std::string &env) {
+		std::lock_guard<std::mutex> transport_lock{transport_mu};
+		transport.set_default_env(env);
+	}
+	class Clock {
+	public:
+		explicit Clock(Registry *registry)
+			: thread{start(registry)} {
+		}
+		~Clock() {
+			stop = true;
+			thread.join();
+		}
+	private:
+		std::thread start(Registry *registry) {
+			registry->set_external_time(std::chrono::time_point_cast<std::chrono::seconds>(std::chrono::system_clock::now()).time_since_epoch().count());
+			return std::thread(&Clock::run, this, registry);
+		}
+		void run(Registry *registry) {
+			while (!stop) {
+				auto atime = std::chrono::time_point_cast<std::chrono::seconds>(std::chrono::system_clock::now()) + std::chrono::seconds{1};
+				std::this_thread::sleep_until(atime);
+				if (stop) {
+					break;
+				}
+				registry->set_external_time(atime.time_since_epoch().count());
+			}
+		}
+		std::thread thread;
+		std::atomic_bool stop{};
+	};
+private:
+	bool update_multivalue_by_key(const TransportUDP::MetricBuilder &key, multivalue_view &value) {
+		auto timestamp = time_now();
+		return update_multivalue_by_ref(get_or_create_bucket(key, timestamp), timestamp, value);
+	}
+	bool update_multivalue_by_ref(const std::shared_ptr<bucket> &ptr, multivalue_view &value) {
+		return update_multivalue_by_ref(ptr, time_now(), value);
+	}
+	bool update_multivalue_by_ref(const std::shared_ptr<bucket> &ptr, uint32_t timestamp, multivalue_view &value) {
+		auto limit = max_bucket_size.load(std::memory_order_relaxed);
+		{
+			std::lock_guard<std::mutex> bucket_lock{ptr->mu};
+			if (timestamp <= ptr->timestamp) {
+				ptr->value.write(value, limit);
+				if (value.empty()) {
+					return true; // fast path
+				}
+				// protect against clock going backwards before falling through
+				timestamp = ptr->timestamp;
+			} else {
+				// next second
+			}
+		}
+		// split
+		size_t queue_size = 0;
+		{
+			std::lock_guard<std::mutex> lock{mu};
+			queue.emplace_back(std::move(*ptr->queue_ptr));
+			*ptr->queue_ptr = alloc_bucket(ptr->key, ptr->timestamp);
+			{
+				std::lock_guard<std::mutex> bucket_lock{ptr->mu};
+				std::swap((*ptr->queue_ptr)->value, ptr->value);
+				ptr->timestamp = timestamp;
+				ptr->queue_ptr = &queue.back();
+				ptr->value.write(value, limit);
+				// assert(value.empty())
+			}
+			queue_size = queue.size();
+		}
+		if (incremental_flush_disabled) {
+			return true;
+		}
+		// flush at most INCREMENTAL_FLUSH_SIZE buckets, don't flush bucket just added
+		std::array<std::shared_ptr<bucket>, INCREMENTAL_FLUSH_SIZE> buffer;
+		flush_some(buffer.data(), std::min(queue_size - 1, buffer.size()));
+		return true;
+	}
+	void flush(uint32_t timestamp) {
+		std::array<std::shared_ptr<bucket>, EXPLICIT_FLUSH_CHUNK_SIZE> buffer;
+		while (flush_some(buffer.data(), buffer.size(), timestamp)) {
+			// pass
+		}
+	}
+	bool flush_some(std::shared_ptr<bucket> *buffer, size_t size, uint32_t timestamp = std::numeric_limits<uint32_t>::max()) {
+		size_t count = 0;
+		{
+			std::lock_guard<std::mutex> lock{mu};
+			for (; count < size && !queue.empty() && queue.front()->timestamp <= timestamp;) {
+				auto &ptr = queue.front();
+				auto keep = false;
+				{
+					std::lock_guard<std::mutex> bucket_lock{ptr->mu};
+					if (!ptr->value.empty()) {
+						buffer[count] = alloc_bucket(ptr->key, ptr->timestamp);
+						std::swap(buffer[count]->value, ptr->value);
+						++count;
+						keep = true;
+					}
+				}
+				// pop front
+				if (keep || ptr.use_count() > 2) {
+					// either there are clients holding bucket reference
+					// or bucket was written recently, move bucket back
+					ptr->timestamp = time_now();
+					queue.push_back(std::move(ptr));
+					queue.back()->queue_ptr = &queue.back();
+				} else {
+					// removing bucket with non-zero "queue_ptr" implies removal from dictionary
+					if (ptr->queue_ptr) {
+						ptr->queue_ptr = nullptr;
+						buckets.erase(string_view{ptr->key.buffer, ptr->key.buffer_pos});
+					}
+					// unused bucket goes into freelist
+					freelist.emplace_back(std::move(ptr));
+				}
+				queue.pop_front();
+			}
+		}
+		for (size_t i = 0; i < count; ++i) {
+			auto &ptr = buffer[i];
+			{
+				std::lock_guard<std::mutex> transport_lock{transport_mu};
+				auto &v = ptr->value;
+				if (!v.values.empty()) {
+					ptr->key.write_values(v.values.data(), v.values.size(), v.count, timestamp);
+				} else if (!v.unique.empty()) {
+					ptr->key.write_unique(v.unique.data(), v.unique.size(), v.count, timestamp);
+				} else if (v.count != 0) {
+					ptr->key.write_count(v.count, timestamp);
+				}
+				v.count = 0;
+				v.values.clear();
+				v.unique.clear();
+			}
+			std::lock_guard<std::mutex> lock{mu};
+			freelist.emplace_back(std::move(ptr));
+		}
+		return count == size;
+	}
+	std::shared_ptr<bucket> get_or_create_bucket(const TransportUDP::MetricBuilder &key, uint32_t timestamp = 0) {
+		std::lock_guard<std::mutex> lock{mu};
+		auto it = buckets.find(string_view{key.buffer, key.buffer_pos});
+		if (it != buckets.end()) {
+			return it->second;
+		}
+		auto ptr = alloc_bucket(key, timestamp ? timestamp : time_now());
+		queue.emplace_back(buckets.emplace(string_view{ptr->key.buffer, ptr->key.buffer_pos}, ptr).first->second);
+		ptr->queue_ptr = &queue.back();
+		return ptr;
+	}
+	std::shared_ptr<bucket> alloc_bucket(const TransportUDP::MetricBuilder &key, uint32_t timestamp) {
+		if (freelist.empty()) {
+			return std::make_shared<bucket>(key, timestamp);
+		}
+		auto ptr = std::move(freelist.back());
+		ptr->key = key;
+		ptr->timestamp = timestamp;
+		freelist.pop_back();
+		return ptr;
+	}
+	uint32_t time_now() const {
+		uint32_t t{time_external};
+		return t != 0 ? t : static_cast<uint32_t>(std::time(nullptr));
+	}
+	struct string_view_hash {
+		size_t operator()(string_view a) const {
+			return hash_bytes(a.data(), a.size(), 0);
+		}
+	};
+	struct string_view_equal {
+		bool operator()(string_view a, string_view b) const {
+			return a.size() == b.size() &&
+				   !std::memcmp(a.data(), b.data(), a.size());
+		}
+	};
+	std::mutex mu;
+	std::mutex transport_mu;
+	std::atomic<size_t> max_bucket_size;
+	std::atomic<uint32_t> time_external;
+	bool incremental_flush_disabled;
+	TransportUDP transport;
+	std::deque<std::shared_ptr<bucket>> queue;
+	std::vector<std::shared_ptr<bucket>> freelist;
+	std::unordered_map<string_view, std::shared_ptr<bucket>, string_view_hash, string_view_equal> buckets;
+};
+
+namespace wyhash {
+// https://github.com/wangyi-fudan/wyhash
+
+//128bit multiply function
+static inline void _wymum(uint64_t *A, uint64_t *B){
+#if defined(__SIZEOF_INT128__)
+  __uint128_t r=*A; r*=*B;
+  *A=(uint64_t)r; *B=(uint64_t)(r>>64);
+#elif defined(_MSC_VER) && defined(_M_X64)
+  *A=_umul128(*A,*B,B);
+#else
+  uint64_t ha=*A>>32, hb=*B>>32, la=(uint32_t)*A, lb=(uint32_t)*B, hi, lo;
+  uint64_t rh=ha*hb, rm0=ha*lb, rm1=hb*la, rl=la*lb, t=rl+(rm0<<32), c=t<rl;
+  lo=t+(rm1<<32); c+=lo<t; hi=rh+(rm0>>32)+(rm1>>32)+c;
+  *A=lo;  *B=hi;
+#endif
+}
+
+//multiply and xor mix function, aka MUM
+static inline uint64_t _wymix(uint64_t A, uint64_t B){ _wymum(&A,&B); return A^B; }
+
+//read functions
+static inline uint64_t _wyr8(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v;}
+static inline uint64_t _wyr4(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v;}
+static inline uint64_t _wyr3(const uint8_t *p, size_t k) { return (((uint64_t)p[0])<<16)|(((uint64_t)p[k>>1])<<8)|p[k-1];}
+
+//wyhash main function
+static inline uint64_t wyhash(const void *key, size_t len, uint64_t seed, const uint64_t *secret){
+  const uint8_t *p=(const uint8_t *)key; seed^=_wymix(seed^secret[0],secret[1]);	uint64_t	a,	b;
+  if(STATSHOUSE_LIKELY(len<=16)){
+    if(STATSHOUSE_LIKELY(len>=4)){ a=(_wyr4(p)<<32)|_wyr4(p+((len>>3)<<2)); b=(_wyr4(p+len-4)<<32)|_wyr4(p+len-4-((len>>3)<<2)); }
+    else if(STATSHOUSE_LIKELY(len>0)){ a=_wyr3(p,len); b=0;}
+    else a=b=0;
+  }
+  else{
+    size_t i=len;
+    if(STATSHOUSE_UNLIKELY(i>48)){
+      uint64_t see1=seed, see2=seed;
+      do{
+        seed=_wymix(_wyr8(p)^secret[1],_wyr8(p+8)^seed);
+        see1=_wymix(_wyr8(p+16)^secret[2],_wyr8(p+24)^see1);
+        see2=_wymix(_wyr8(p+32)^secret[3],_wyr8(p+40)^see2);
+        p+=48; i-=48;
+      }while(STATSHOUSE_UNLIKELY(i>48));
+      seed^=see1^see2;
+    }
+    while(STATSHOUSE_UNLIKELY(i>16)){  seed=_wymix(_wyr8(p)^secret[1],_wyr8(p+8)^seed);  i-=16; p+=16;  }
+    a=_wyr8(p+i-16);  b=_wyr8(p+i-8);
+  }
+  a^=secret[1]; b^=seed;  _wymum(&a,&b);
+  return  _wymix(a^secret[0]^len,b^secret[1]);
+}
+
+//the default secret parameters
+static const uint64_t _wyp[4] = {0xa0761d6478bd642full, 0xe7037ed1a0b428dbull, 0x8ebc6af09c88c6e3ull, 0x589965cc75374cc3ull};
+
+} // namespace wyhash
+
+uint64_t hash_bytes(const void *ptr, size_t len, uint64_t seed) {
+    return wyhash::wyhash(ptr, len, seed, wyhash::_wyp);
+}
 
 } // namespace statshouse
 
