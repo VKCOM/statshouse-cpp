@@ -31,12 +31,22 @@
 #include <vector>
 
 // Use #ifdefs to include headers for various platforms here
+#ifdef _WIN32
+#include <ws2tcpip.h>
+#include <string.h> // strerror
+
+#define STATSHOUSE_UNLIKELY(x) (x)
+#define STATSHOUSE_LIKELY(x)   (x)
+#define _CRT_SECURE_NO_WARNINGS
+#define close closesocket
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <unistd.h>
 
 #define STATSHOUSE_UNLIKELY(x) __builtin_expect((x), 0) // could improve packing performance on your platform. Set to (x) to disable
 #define STATSHOUSE_LIKELY(x)   __builtin_expect((x), 1)
+#endif
 
 namespace statshouse {
 
@@ -701,7 +711,11 @@ private:
 			return false;
 		}
 
+#ifdef _WIN32
+		int result = sendto(udp_socket, data, size, 0, nullptr, 0);
+#else
 		ssize_t result = ::sendto(udp_socket, data, size, MSG_DONTWAIT, nullptr, 0);
+#endif
 
 		if (result >= 0) {
 			return true;
@@ -754,6 +768,14 @@ private:
 			set_errno_error(errno, "statshouse::TransportUDP connect() failed");
 			return -1;
 		}
+#ifdef _WIN32
+		u_long mode = 1; // non-blocking mode
+		if (ioctlsocket(sock, FIONBIO, &mode) != NO_ERROR) {
+			::close(sock);
+			set_errno_error(WSAGetLastError(), "statshouse::TransportUDP ioctlsocket() failed");
+			return -1;
+		}
+#endif
 		return sock;
 	}
 	void set_errno_error(int err, const char *msg) {
@@ -799,13 +821,13 @@ private:
 			, unique{nullptr} {
 		}
 		multivalue_view(double count, size_t values_count, const double *values)
-			: count{std::max(count, static_cast<double>(values_count))}
+			: count{(std::max)(count, static_cast<double>(values_count))}
 			, values_count{values_count}
 			, values{values}
 			, unique{nullptr} {
 		}
 		multivalue_view(double count, size_t values_count, const uint64_t *unique)
-			: count{std::max(count, static_cast<double>(values_count))}
+			: count{(std::max)(count, static_cast<double>(values_count))}
 			, values_count{values_count}
 			, values{nullptr}
 			, unique{unique} {
@@ -835,7 +857,7 @@ private:
 				return;
 			}
 			// limit size & count
-			auto effective_size = std::min(src_size, limit - dst.size());
+			auto effective_size = (std::min)(src_size, limit - dst.size());
 			auto effective_count = (effective_size / src_size) * src_count;
 			// update this
 			dst.insert(dst.end(), src, src + effective_size);
@@ -1061,7 +1083,7 @@ private:
 		}
 		// flush at most INCREMENTAL_FLUSH_SIZE buckets, don't flush bucket just added
 		std::array<std::shared_ptr<bucket>, INCREMENTAL_FLUSH_SIZE> buffer;
-		flush_some(buffer.data(), std::min(queue_size - 1, buffer.size()));
+		flush_some(buffer.data(), (std::min)(queue_size - 1, buffer.size()));
 		return true;
 	}
 	void flush(uint32_t timestamp) {
@@ -1070,7 +1092,7 @@ private:
 			// pass
 		}
 	}
-	bool flush_some(std::shared_ptr<bucket> *buffer, size_t size, uint32_t timestamp = std::numeric_limits<uint32_t>::max()) {
+	bool flush_some(std::shared_ptr<bucket> *buffer, size_t size, uint32_t timestamp = (std::numeric_limits<uint32_t>::max)()) {
 		size_t count = 0;
 		{
 			std::lock_guard<std::mutex> lock{mu};
@@ -1178,3 +1200,8 @@ private:
 #undef STATSHOUSE_UNLIKELY
 #undef STATSHOUSE_USAGE_METRIC
 #undef STATSHOUSE_TRANSPORT_VERSION
+
+#ifdef _WIN32
+#undef _CRT_SECURE_NO_WARNINGS
+#undef close
+#endif
