@@ -793,7 +793,8 @@ class Registry {
 	enum {
 		DEFAULT_MAX_BUCKET_SIZE = 1024,
 		EXPLICIT_FLUSH_CHUNK_SIZE = 10,
-		INCREMENTAL_FLUSH_SIZE = 2,
+		INCREMENTAL_FLUSH_BUCKET_COUNT = 2,
+		REGULAR_MEASUREMENT_MAX_LAG_SECONDS = 5,
 	};
 public:
 	Registry()
@@ -881,6 +882,7 @@ private:
 		}
 		TransportUDP::MetricBuilder key;
 		uint32_t timestamp;
+		int regular;
 		multivalue value;
 		std::mutex mu;
 		std::shared_ptr<bucket> *queue_ptr;
@@ -926,6 +928,32 @@ public:
 		Registry *registry;
 		std::shared_ptr<bucket> ptr;
 	};
+	class MetricValueRef {
+	public:
+		MetricValueRef(Registry *registry, const TransportUDP::MetricBuilder &key)
+			: registry{registry}
+			, ptr{registry->get_or_create_bucket(key)} {
+			std::lock_guard<std::mutex> bucket_lock{ptr->mu};
+			++ptr->regular;
+		}
+		~MetricValueRef() {
+			if (ptr) { // might be null after move constructor/assignment
+				std::lock_guard<std::mutex> bucket_lock{ptr->mu};
+				--ptr->regular;
+			}
+		}
+		MetricValueRef(const MetricValueRef &other) = delete;
+		MetricValueRef(MetricValueRef &&other) = default; // allows return by value from "regular_ref"
+		MetricValueRef &operator=(const MetricValueRef &other) = delete;
+		MetricValueRef &operator=(MetricValueRef &&other) = default;
+		bool set_value(double value) const {
+			multivalue_view v{1, 1, &value};
+			return registry->update_multivalue_by_ref(ptr, v);
+		}
+	private:
+		Registry *registry;
+		std::shared_ptr<bucket> ptr;
+	};
 	class MetricBuilder {
 	public:
 		MetricBuilder(Registry *registry, string_view name)
@@ -946,6 +974,9 @@ public:
 		}
 		MetricRef ref() const {
 			return MetricRef{registry, key};
+		}
+		MetricValueRef value_ref() const {
+			return MetricValueRef{registry, key};
 		}
 		bool write_count(double count, uint32_t timestamp = 0) const {
 			if (timestamp) {
@@ -1040,14 +1071,14 @@ public:
 		std::atomic_bool stop{};
 	};
 private:
-	bool update_multivalue_by_key(const TransportUDP::MetricBuilder &key, multivalue_view &value) {
+	bool update_multivalue_by_key(const TransportUDP::MetricBuilder &key, multivalue_view value) {
 		auto timestamp = time_now();
 		return update_multivalue_by_ref(get_or_create_bucket(key, timestamp), timestamp, value);
 	}
-	bool update_multivalue_by_ref(const std::shared_ptr<bucket> &ptr, multivalue_view &value) {
+	bool update_multivalue_by_ref(const std::shared_ptr<bucket> &ptr, multivalue_view value) {
 		return update_multivalue_by_ref(ptr, time_now(), value);
 	}
-	bool update_multivalue_by_ref(const std::shared_ptr<bucket> &ptr, uint32_t timestamp, multivalue_view &value) {
+	bool update_multivalue_by_ref(const std::shared_ptr<bucket> &ptr, uint32_t timestamp, multivalue_view value) {
 		auto limit = max_bucket_size.load(std::memory_order_relaxed);
 		{
 			std::lock_guard<std::mutex> bucket_lock{ptr->mu};
@@ -1082,7 +1113,7 @@ private:
 			return true;
 		}
 		// flush at most INCREMENTAL_FLUSH_SIZE buckets, don't flush bucket just added
-		std::array<std::shared_ptr<bucket>, INCREMENTAL_FLUSH_SIZE> buffer;
+		std::array<std::shared_ptr<bucket>, INCREMENTAL_FLUSH_BUCKET_COUNT> buffer;
 		flush_some(buffer.data(), (std::min)(queue_size - 1, buffer.size()));
 		return true;
 	}
@@ -1094,8 +1125,10 @@ private:
 	}
 	bool flush_some(std::shared_ptr<bucket> *buffer, size_t size, uint32_t timestamp = (std::numeric_limits<uint32_t>::max)()) {
 		size_t count = 0;
+		uint32_t now;
 		{
 			std::lock_guard<std::mutex> lock{mu};
+			now = time_now();
 			for (; count < size && !queue.empty() && queue.front()->timestamp <= timestamp;) {
 				auto &ptr = queue.front();
 				auto keep = false;
@@ -1104,6 +1137,11 @@ private:
 					if (!ptr->value.empty()) {
 						buffer[count] = alloc_bucket(ptr->key, ptr->timestamp);
 						std::swap(buffer[count]->value, ptr->value);
+						if (ptr->regular != 0 && buffer[count]->value.values.size() != 0) {
+							buffer[count]->regular = 1;
+							ptr->value.values.push_back(buffer[count]->value.values.back());
+							ptr->value.count = 1;
+						}
 						++count;
 						keep = true;
 					}
@@ -1112,7 +1150,7 @@ private:
 				if (keep || ptr.use_count() > 2) {
 					// either there are clients holding bucket reference
 					// or bucket was written recently, move bucket back
-					ptr->timestamp = time_now();
+					ptr->timestamp = now;
 					queue.push_back(std::move(ptr));
 					queue.back()->queue_ptr = &queue.back();
 				} else {
@@ -1133,15 +1171,17 @@ private:
 				std::lock_guard<std::mutex> transport_lock{transport_mu};
 				auto &v = ptr->value;
 				if (!v.values.empty()) {
-					ptr->key.write_values(v.values.data(), v.values.size(), v.count, timestamp);
+					ptr->key.write_values(v.values.data(), v.values.size(), v.count, ptr->timestamp);
 				} else if (!v.unique.empty()) {
-					ptr->key.write_unique(v.unique.data(), v.unique.size(), v.count, timestamp);
+					ptr->key.write_unique(v.unique.data(), v.unique.size(), v.count, ptr->timestamp);
 				} else if (v.count != 0) {
-					ptr->key.write_count(v.count, timestamp);
+					ptr->key.write_count(v.count, ptr->timestamp);
 				}
-				v.count = 0;
-				v.values.clear();
-				v.unique.clear();
+				if (ptr->regular != 0 && ptr->value.values.size() != 0) {
+					for (auto lag = 0; lag < REGULAR_MEASUREMENT_MAX_LAG_SECONDS && ++ptr->timestamp < now; ++lag) {
+						ptr->key.write_value(v.values.back(), ptr->timestamp);
+					}
+				}
 			}
 			std::lock_guard<std::mutex> lock{mu};
 			freelist.emplace_back(std::move(ptr));
@@ -1166,6 +1206,11 @@ private:
 		auto ptr = std::move(freelist.back());
 		ptr->key = key;
 		ptr->timestamp = timestamp;
+		ptr->regular = 0;
+		ptr->value.count = 0;
+		ptr->value.values.clear();
+		ptr->value.unique.clear();
+		ptr->queue_ptr = nullptr;
 		freelist.pop_back();
 		return ptr;
 	}
