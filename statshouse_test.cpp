@@ -188,7 +188,8 @@ void benchmark_best_case<Registry>() {
         .tag("12", dynamic_tags[3])
         .tag("13", dynamic_tags[4])
         .tag("14", dynamic_tags[5])
-        .tag("15", dynamic_tags[6]);
+        .tag("15", dynamic_tags[6])
+        .ref();
     for (auto i = 0; i < 1000000; i++) {
         m.write_value(1);
     }
@@ -199,6 +200,26 @@ void benchmark_best_case<Registry>() {
     t.flush(true);
     auto end = std::chrono::steady_clock::now();
     std::printf("Registry! elapsed %ld milliseconds\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count());
+}
+
+void send_regular() {
+    Registry t;
+    t.disable_incremental_flush();
+    auto m = t.metric("malpinskiy_investigation")
+            .tag("a976207097145020")
+            .tag("a058992634786402")
+            .tag("a361387731010001")
+            .tag("a057341188320915")
+            .tag("a913170170684600")
+            .tag("a268289295741267")
+            .tag("a704131134786936")
+            .value_ref();;
+    m.set_value(1);
+    for (;;) {
+        std::this_thread::sleep_until(std::chrono::time_point_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now()) + std::chrono::seconds{1});
+        t.flush();
+    }
 }
 
 } // namespace test
@@ -213,4 +234,5 @@ int main() {
     // statshouse::test::benchmark_worst_case<statshouse::TransportUDP>();
     // statshouse::test::benchmark_best_case<statshouse::TransportUDP>();
     // statshouse::test::benchmark_best_case<statshouse::Registry>();
+    // statshouse::test::send_regular();
 }
