@@ -222,6 +222,24 @@ void send_regular() {
     }
 }
 
+void registry_logging() {
+    Registry::options opt{};
+    opt.logger = puts;
+    Registry t{opt};
+    t.set_metrics_logging_enabled(true);
+    auto m = t.metric("malpinskiy_investigation")
+        .tag(std::string(256, 'q'), "9")
+        .tag("10", std::string(256, '0'))
+        .tag("11", "1")
+        .tag("12", "2")
+        .tag("13", std::string(512, '0'))
+        .tag("14", "")
+        .tag("15", "");
+    m.write_count(1);
+    m.write_value(2);
+    m.write_unique(3);
+}
+
 } // namespace test
 } // namespace statshouse
 
@@ -235,4 +253,5 @@ int main() {
     // statshouse::test::benchmark_best_case<statshouse::TransportUDP>();
     // statshouse::test::benchmark_best_case<statshouse::Registry>();
     // statshouse::test::send_regular();
+    // statshouse::test::registry_logging();
 }

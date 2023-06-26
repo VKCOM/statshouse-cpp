@@ -23,12 +23,16 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <cstdio>    // vsnprintf
+#include <cstdarg>   // va_list, va_start, va_end
+#include <cinttypes> // PRIu32, PRIu64
 
 // Use #ifdefs to include headers for various platforms here
 #ifdef _WIN32
@@ -795,14 +799,39 @@ class Registry {
 		EXPLICIT_FLUSH_CHUNK_SIZE = 10,
 		INCREMENTAL_FLUSH_BUCKET_COUNT = 2,
 		REGULAR_MEASUREMENT_MAX_LAG_SECONDS = 5,
+		LOG_BUFFER_SIZE = 1024,
 	};
 public:
+	struct options {
+		std::string default_env;
+		std::string host{"127.0.0.1"};
+		int port{TransportUDP::DEFAULT_PORT};
+		size_t max_udp_packet_size{0};
+		size_t max_bucket_size{DEFAULT_MAX_BUCKET_SIZE};
+		std::function<int (const char *)> logger;
+		bool incremental_flush_disabled{false};
+	};
+	explicit Registry(const options &o)
+		: max_bucket_size{o.max_bucket_size}
+		, time_external{0}
+		, metrics_logging_enabled{false}
+		, logger{o.logger}
+		, incremental_flush_disabled{o.incremental_flush_disabled}
+		, transport{o.host, o.port} {
+		if (!o.default_env.empty()) {
+			transport.set_default_env(o.default_env);
+		}
+		if (o.max_udp_packet_size != 0) {
+			transport.set_max_udp_packet_size(o.max_udp_packet_size);
+		}
+	}
 	Registry()
 		: Registry("127.0.0.1", TransportUDP::DEFAULT_PORT) {
 	}
 	Registry(const std::string &host, int port)
 		: max_bucket_size{DEFAULT_MAX_BUCKET_SIZE}
 		, time_external{0}
+		, metrics_logging_enabled{false}
 		, incremental_flush_disabled{false}
 		, transport{host, port} {
 	}
@@ -853,17 +882,18 @@ private:
 			}
 		}
 		template <typename T>
-		void write(std::vector<T> &dst, const T *src, size_t &src_size, double &src_count, size_t limit) {
+		void write(std::vector<T> &dst, const T * &src, size_t &src_size, double &src_count, size_t limit) {
 			if (!src_size || limit <= dst.size()) {
 				return;
 			}
 			// limit size & count
 			auto effective_size = (std::min)(src_size, limit - dst.size());
-			auto effective_count = (effective_size / src_size) * src_count;
+			auto effective_count = (src_count * effective_size) / src_size;
 			// update this
 			dst.insert(dst.end(), src, src + effective_size);
 			count += effective_count;
 			// update arguments
+			src += effective_size;
 			src_size -= effective_size;
 			src_count -= effective_count;
 		}
@@ -895,6 +925,7 @@ public:
 			, ptr{registry->get_or_create_bucket(key)} {
 		}
 		bool write_count(double count, uint32_t timestamp = 0) const {
+			registry->log_count(ptr->key, count, timestamp);
 			if (timestamp) {
 				std::lock_guard<std::mutex> transport_lock{registry->transport_mu};
 				return ptr->key.write_count(count, timestamp);
@@ -906,6 +937,7 @@ public:
 			return write_values(&value, 1, 1, timestamp);
 		}
 		bool write_values(const double *values, size_t values_count, double count = 0, uint32_t timestamp = 0) const {
+			registry->log_values(ptr->key, values,  values_count, count, timestamp);
 			if (timestamp || values_count >= registry->max_bucket_size.load(std::memory_order_relaxed)) {
 				std::lock_guard<std::mutex> transport_lock{registry->transport_mu};
 				return ptr->key.write_values(values, values_count, count, timestamp);
@@ -917,6 +949,7 @@ public:
 			return write_unique(&value, 1, 1, timestamp);
 		}
 		bool write_unique(const uint64_t *values, size_t values_count, double count, uint32_t timestamp = 0) const {
+			registry->log_unique(ptr->key, values,  values_count, count, timestamp);
 			if (timestamp || values_count >= registry->max_bucket_size.load(std::memory_order_relaxed)) {
 				std::lock_guard<std::mutex> transport_lock{registry->transport_mu};
 				return ptr->key.write_unique(values, values_count, count, timestamp);
@@ -937,9 +970,13 @@ public:
 			++ptr->regular;
 		}
 		~MetricValueRef() {
+			auto n = 0;
 			if (ptr) { // might be null after move constructor/assignment
 				std::lock_guard<std::mutex> bucket_lock{ptr->mu};
-				--ptr->regular;
+				n = --ptr->regular;
+			}
+			if (n < 0) {
+				registry->log_error("unexpected bucket regular reference count value %d", n);
 			}
 		}
 		MetricValueRef(const MetricValueRef &other) = delete;
@@ -979,6 +1016,7 @@ public:
 			return MetricValueRef{registry, key};
 		}
 		bool write_count(double count, uint32_t timestamp = 0) const {
+			registry->log_count(key, count, timestamp);
 			if (timestamp) {
 				std::lock_guard<std::mutex> transport_lock{registry->transport_mu};
 				return key.write_count(count, timestamp);
@@ -990,6 +1028,7 @@ public:
 			return write_values(&value, 1, 1, timestamp);
 		}
 		bool write_values(const double *values, size_t values_count, double count = 0, uint32_t timestamp = 0) const {
+			registry->log_values(key, values,  values_count, count, timestamp);
 			if (timestamp || values_count >= registry->max_bucket_size.load(std::memory_order_relaxed)) {
 				std::lock_guard<std::mutex> transport_lock{registry->transport_mu};
 				return key.write_values(values, values_count, count, timestamp);
@@ -1001,6 +1040,7 @@ public:
 			return write_unique(&value, 1, 1, timestamp);
 		}
 		bool write_unique(const uint64_t *values, size_t values_count, double count, uint32_t timestamp = 0) const {
+			registry->log_unique(key, values,  values_count, count, timestamp);
 			if (timestamp || values_count >= registry->max_bucket_size.load(std::memory_order_relaxed)) {
 				std::lock_guard<std::mutex> transport_lock{registry->transport_mu};
 				return key.write_unique(values, values_count, count, timestamp);
@@ -1042,6 +1082,13 @@ public:
 	void set_default_env(const std::string &env) {
 		std::lock_guard<std::mutex> transport_lock{transport_mu};
 		transport.set_default_env(env);
+	}
+	bool set_metrics_logging_enabled(bool enabled) {
+		if (!logger) {
+			return false;
+		}
+		metrics_logging_enabled.store(enabled, std::memory_order_relaxed);
+		return true;
 	}
 	class Clock {
 	public:
@@ -1218,6 +1265,130 @@ private:
 		uint32_t t{time_external};
 		return t != 0 ? t : static_cast<uint32_t>(std::time(nullptr));
 	}
+	inline void log_count(const TransportUDPBase::MetricBuilder &key, double count, uint32_t timestamp) const {
+		if (!metrics_logging_enabled.load(std::memory_order_relaxed)) return;
+		log_message_writer w{};
+		w.write_key(key) && w.write_count(count, timestamp);
+		logger(w.msg);
+	}
+	inline void log_values(const TransportUDPBase::MetricBuilder &key, const double *values, size_t values_count, double count, uint32_t timestamp) const {
+		if (!metrics_logging_enabled.load(std::memory_order_relaxed)) return;
+		log_message_writer w{};
+		w.write_key(key) && w.write_count(count, timestamp) && w.write_array("values", "%f", values, values_count);
+		logger(w.msg);
+	}
+	inline void log_unique(const TransportUDPBase::MetricBuilder &key, const uint64_t *values, size_t values_count, double count, uint32_t timestamp) const {
+		if (!metrics_logging_enabled.load(std::memory_order_relaxed)) return;
+		log_message_writer w{};
+		w.write_key(key) && w.write_count(count, timestamp) && w.write_array("unique", "%" PRIu64, values, values_count);
+		logger(w.msg);
+	}
+	inline void log_error(const char *format, ...) const {
+		if (!logger) return;
+		va_list args;
+		va_start(args, format);
+		log_message_writer w{};
+		w.write_string("error ") && w.vwritef(format, args);
+		logger(w.msg);
+		va_end(args);
+	}
+	struct log_message_writer {
+		log_message_writer()
+			: msg{buffer()}
+			, end{msg + LOG_BUFFER_SIZE}
+			, it{msg} {
+			it[0] = 0; // empty message
+		}
+		bool write_key(const TransportUDPBase::MetricBuilder &key) {
+			if (!write_string("name=")) return false;
+			const char *str;
+			size_t len, fullLen, pos = 0;
+			if (!get_string(key, pos, str, len, fullLen)) return true;
+			if (!write_string(str, len)) return false;
+			pos += fullLen + 4; // also skip tag count
+			if (!write_string(" tags={")) return false;
+			for (auto i = 0; i < TransportUDPBase::MAX_KEYS && pos < key.buffer_pos; ++i) {
+				if (i != 0 && !write_string(",")) return false;
+				if (!get_string(key, pos, str, len, fullLen)) break;
+				if (!write_string(str, len) || !write_string("=")) return false;
+				pos += fullLen;
+				if (!get_string(key, pos, str, len, fullLen)) break;
+				if (!write_string(str, len)) return false;
+				pos += fullLen;
+			}
+			return write_string("}");
+		}
+		bool get_string(const TransportUDPBase::MetricBuilder &key, size_t pos, const char * &str, size_t &len, size_t &fullLen) {
+			if (key.buffer_pos <= pos) return false;
+			if (key.buffer[pos] == static_cast<char>(TransportUDPBase::TL_BIG_STRING_MARKER)) {
+				str = key.buffer + pos + 4;
+				len = static_cast<size_t>(key.buffer[pos+3]) |
+				      static_cast<size_t>(key.buffer[pos+2]) << 8 |
+				      static_cast<size_t>(key.buffer[pos+1]) << 16;
+				fullLen = (4 + len + 3) & ~3;
+			} else {
+				str = key.buffer + pos + 1;
+				len = static_cast<size_t>(key.buffer[pos]);
+				fullLen = (1 + len + 3) & ~3;
+			}
+			return true;
+		}
+		inline bool write_string(const char *str) {
+			return write_string(str, strlen(str));
+		}
+		bool write_string(const char *str, size_t len) {
+			if (len == 0) return true;
+			auto cap = static_cast<size_t>(end - it);
+			if (len >= cap) {
+				len = cap - 1;
+			}
+			std::memcpy(it, str, len);
+			it[len] = 0;
+			it += len;
+			return !eof();
+		}
+		template<typename T>
+		bool write_array(const char *key, const char *format, const T *values, size_t values_count) {
+			if (!writef(" %s=[", key)) return false;
+			for (size_t i = 0; i < values_count; ++i) {
+				if (i != 0 && !write_string(",")) return false;
+				if (!writef(format, values[i])) return false;
+			}
+			return write_string("]");
+		}
+		inline bool write_count(double count, uint32_t timestamp) {
+			return writef(" count=%f timestamp=%" PRIu32, count, timestamp);
+		}
+		bool writef(const char *format, ...) {
+			va_list args;
+			va_start(args, format);
+			auto res = vwritef(format, args);
+			va_end(args);
+			return res;
+		}
+		bool vwritef(const char *format, va_list args) {
+			auto maxlen = static_cast<int>(end - it);
+			auto n = vsnprintf(it, maxlen, format, args);
+			if (n < 0) {
+				*it = 0; // ensure null terminated
+			} else if (maxlen - 1 <= n) {
+				it = end;
+			} else {
+				it += n;
+			}
+			return !(n < 0 || eof());
+		}
+		inline bool eof() const {
+			return (end - it) <= 1;
+		}
+		static char * buffer() {
+			thread_local char s[LOG_BUFFER_SIZE];
+			return s;
+		}
+		char * const msg;
+		char * const end;
+		char *it;
+	};
 	struct string_view_hash {
 		size_t operator()(string_view a) const {
 			return wyhash::wyhash(a.data(), a.size(), 0, wyhash::_wyp);
@@ -1233,6 +1404,8 @@ private:
 	std::mutex transport_mu;
 	std::atomic<size_t> max_bucket_size;
 	std::atomic<uint32_t> time_external;
+	std::atomic_bool metrics_logging_enabled;
+	std::function<int (const char *)> logger; // "puts" signature
 	bool incremental_flush_disabled;
 	TransportUDP transport;
 	std::deque<std::shared_ptr<bucket>> queue;
