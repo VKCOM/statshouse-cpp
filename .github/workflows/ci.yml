@@ -14,4 +14,4 @@ jobs:
         with:
           fetch-depth: 1
           install-go: false
-      - run: g++ -std=c++11 -Wno-noexcept-type -g -Wall -Wextra -Werror=return-type statshouse_test.cpp
+      - run: g++ -std=c++11 -Wno-noexcept-type -g -Wall -Wextra -Werror=return-type --verbose statshouse_test.cpp
