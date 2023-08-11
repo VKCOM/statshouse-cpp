@@ -1092,9 +1092,19 @@ public:
 		metrics_logging_enabled.store(enabled, std::memory_order_relaxed);
 		return true;
 	}
-	TransportUDPBase::Stats get_stats() const {
+	struct Stats : TransportUDPBase::Stats {
+		size_t queue_size;
+		size_t freelist_size;
+		size_t bucket_count;
+	};
+	Stats get_stats() const {
+		Stats res;
+		res.queue_size = stat.queue_size.load(std::memory_order_relaxed);
+		res.freelist_size = stat.freelist_size.load(std::memory_order_relaxed);
+		res.bucket_count = stat.bucket_count.load(std::memory_order_relaxed);
 		std::lock_guard<std::mutex> transport_lock{transport_mu};
-		return transport.get_stats();
+		static_cast<TransportUDPBase::Stats&>(res) = transport.get_stats();
+		return res;
 	}
 	void clear_stats() {
 		std::lock_guard<std::mutex> transport_lock{transport_mu};
@@ -1165,6 +1175,7 @@ private:
 				// assert(value.empty())
 			}
 			queue_size = queue.size();
+			stat.queue_size.store(queue_size, std::memory_order_relaxed);
 		}
 		if (incremental_flush_disabled) {
 			return true;
@@ -1213,11 +1224,14 @@ private:
 					if (ptr->queue_ptr) {
 						ptr->queue_ptr = nullptr;
 						buckets.erase(string_view{ptr->key.buffer, ptr->key.buffer_pos});
+						stat.bucket_count.store(buckets.size(), std::memory_order_relaxed);
 					}
 					// unused bucket goes into freelist
 					freelist.emplace_back(std::move(ptr));
+					stat.freelist_size.store(freelist.size(), std::memory_order_relaxed);
 				}
 				queue.pop_front();
+				stat.queue_size.store(queue.size(), std::memory_order_relaxed);
 			}
 		}
 		for (size_t i = 0; i < count; ++i) {
@@ -1240,6 +1254,7 @@ private:
 			}
 			std::lock_guard<std::mutex> lock{mu};
 			freelist.emplace_back(std::move(ptr));
+			stat.freelist_size.store(freelist.size(), std::memory_order_relaxed);
 		}
 		return count == size;
 	}
@@ -1252,6 +1267,8 @@ private:
 		auto ptr = alloc_bucket(key, timestamp ? timestamp : time_now());
 		queue.emplace_back(buckets.emplace(string_view{ptr->key.buffer, ptr->key.buffer_pos}, ptr).first->second);
 		ptr->queue_ptr = &queue.back();
+		stat.queue_size.store(queue.size(), std::memory_order_relaxed);
+		stat.bucket_count.store(buckets.size(), std::memory_order_relaxed);
 		return ptr;
 	}
 	std::shared_ptr<bucket> alloc_bucket(const TransportUDP::MetricBuilder &key, uint32_t timestamp) {
@@ -1267,6 +1284,7 @@ private:
 		ptr->value.unique.clear();
 		ptr->queue_ptr = nullptr;
 		freelist.pop_back();
+		stat.freelist_size.store(freelist.size(), std::memory_order_relaxed);
 		return ptr;
 	}
 	uint32_t time_now() const {
@@ -1408,6 +1426,11 @@ private:
 				   !std::memcmp(a.data(), b.data(), a.size());
 		}
 	};
+	struct statistics {
+		std::atomic<size_t> queue_size;
+		std::atomic<size_t> freelist_size;
+		std::atomic<size_t> bucket_count;
+	};
 	std::mutex mu;
 	mutable std::mutex transport_mu;
 	std::atomic<size_t> max_bucket_size;
@@ -1419,6 +1442,7 @@ private:
 	std::deque<std::shared_ptr<bucket>> queue;
 	std::vector<std::shared_ptr<bucket>> freelist;
 	std::unordered_map<string_view, std::shared_ptr<bucket>, string_view_hash, string_view_equal> buckets;
+	statistics stat{};
 };
 
 } // namespace statshouse
