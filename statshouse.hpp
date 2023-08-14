@@ -1057,6 +1057,10 @@ public:
 	MetricBuilder metric(string_view name) {
 		return {this, name};
 	}
+ 	bool write_usage_metrics(string_view project, string_view cluster) {
+		std::lock_guard<std::mutex> transport_lock{transport_mu};
+   		return transport.write_usage_metrics(project, cluster);
+ 	}
 	// If called once, then you need to call it until the end of the life of the registry.
 	void set_external_time(uint32_t timestamp) {
 		time_external = timestamp;
