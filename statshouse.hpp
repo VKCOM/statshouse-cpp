@@ -850,14 +850,14 @@ private:
 			, values{nullptr}
 			, unique{nullptr} {
 		}
-		multivalue_view(double count, size_t values_count, const double *values)
-			: count{(std::max)(count, static_cast<double>(values_count))}
+		multivalue_view(size_t values_count, const double *values)
+			: count{0}
 			, values_count{values_count}
 			, values{values}
 			, unique{nullptr} {
 		}
-		multivalue_view(double count, size_t values_count, const uint64_t *unique)
-			: count{(std::max)(count, static_cast<double>(values_count))}
+		multivalue_view(size_t values_count, const uint64_t *unique)
+			: count{0}
 			, values_count{values_count}
 			, values{nullptr}
 			, unique{unique} {
@@ -873,29 +873,26 @@ private:
 	struct multivalue {
 		void write(multivalue_view &src, size_t limit) {
 			if (src.values) {
-				write(values, src.values, src.values_count, src.count, limit);
+				write(values, src.values, src.values_count, limit);
 			} else if (src.unique) {
-				write(unique, src.unique, src.values_count, src.count, limit);
+				write(unique, src.unique, src.values_count, limit);
 			} else {
 				count += src.count;
 				src.count = 0;
 			}
 		}
 		template <typename T>
-		void write(std::vector<T> &dst, const T * &src, size_t &src_size, double &src_count, size_t limit) {
+		void write(std::vector<T> &dst, const T * &src, size_t &src_size, size_t limit) {
 			if (!src_size || limit <= dst.size()) {
 				return;
 			}
-			// limit size & count
-			auto effective_size = (std::min)(src_size, limit - dst.size());
-			auto effective_count = (src_count * effective_size) / src_size;
-			// update this
-			dst.insert(dst.end(), src, src + effective_size);
-			count += effective_count;
-			// update arguments
-			src += effective_size;
-			src_size -= effective_size;
-			src_count -= effective_count;
+			auto n = (std::min)(src_size, limit - dst.size());
+			dst.reserve(limit); // minimize the number of memory allocations
+			for (size_t i = 0; i < n; ++i) {
+				dst.push_back(src[i]);
+			}
+			src += n;
+			src_size -= n;
 		}
 		bool empty() const {
 			return count == 0 && values.empty() && unique.empty();
@@ -908,6 +905,7 @@ private:
 		bucket(const TransportUDP::MetricBuilder &key, uint32_t timestamp)
 			: key{key}
 			, timestamp{timestamp}
+			, regular{0}
 			, queue_ptr{nullptr} {
 		}
 		TransportUDP::MetricBuilder key;
@@ -938,11 +936,12 @@ public:
 		}
 		bool write_values(const double *values, size_t values_count, double count = 0, uint32_t timestamp = 0) const {
 			registry->log_values(ptr->key, values,  values_count, count, timestamp);
-			if (timestamp || values_count >= registry->max_bucket_size.load(std::memory_order_relaxed)) {
+			auto sampling = count != 0 && count != values_count;
+			if (sampling || timestamp || values_count >= registry->max_bucket_size.load(std::memory_order_relaxed)) {
 				std::lock_guard<std::mutex> transport_lock{registry->transport_mu};
 				return ptr->key.write_values(values, values_count, count, timestamp);
 			}
-			multivalue_view value{count, values_count, values};
+			multivalue_view value{values_count, values};
 			return registry->update_multivalue_by_ref(ptr, value);
 		}
 		bool write_unique(uint64_t value, uint32_t timestamp = 0) const {
@@ -950,11 +949,12 @@ public:
 		}
 		bool write_unique(const uint64_t *values, size_t values_count, double count, uint32_t timestamp = 0) const {
 			registry->log_unique(ptr->key, values,  values_count, count, timestamp);
-			if (timestamp || values_count >= registry->max_bucket_size.load(std::memory_order_relaxed)) {
+			auto sampling = count != 0 && count != values_count;
+			if (sampling || timestamp || values_count >= registry->max_bucket_size.load(std::memory_order_relaxed)) {
 				std::lock_guard<std::mutex> transport_lock{registry->transport_mu};
 				return ptr->key.write_unique(values, values_count, count, timestamp);
 			}
-			multivalue_view value{count, values_count, values};
+			multivalue_view value{values_count, values};
 			return registry->update_multivalue_by_ref(ptr, value);
 		}
 	private:
@@ -984,7 +984,7 @@ public:
 		MetricValueRef &operator=(const MetricValueRef &other) = delete;
 		MetricValueRef &operator=(MetricValueRef &&other) = default;
 		bool set_value(double value) const {
-			multivalue_view v{1, 1, &value};
+			multivalue_view v{1, &value};
 			return registry->update_multivalue_by_ref(ptr, v);
 		}
 	private:
@@ -1029,11 +1029,12 @@ public:
 		}
 		bool write_values(const double *values, size_t values_count, double count = 0, uint32_t timestamp = 0) const {
 			registry->log_values(key, values,  values_count, count, timestamp);
-			if (timestamp || values_count >= registry->max_bucket_size.load(std::memory_order_relaxed)) {
+			auto sampling = count != 0 && count != values_count;
+			if (sampling || timestamp || values_count >= registry->max_bucket_size.load(std::memory_order_relaxed)) {
 				std::lock_guard<std::mutex> transport_lock{registry->transport_mu};
 				return key.write_values(values, values_count, count, timestamp);
 			}
-			multivalue_view value{count, values_count, values};
+			multivalue_view value{values_count, values};
 			return registry->update_multivalue_by_key(key, value);
 		}
 		bool write_unique(uint64_t value, uint32_t timestamp = 0) const {
@@ -1041,11 +1042,12 @@ public:
 		}
 		bool write_unique(const uint64_t *values, size_t values_count, double count, uint32_t timestamp = 0) const {
 			registry->log_unique(key, values,  values_count, count, timestamp);
-			if (timestamp || values_count >= registry->max_bucket_size.load(std::memory_order_relaxed)) {
+			auto sampling = count != 0 && count != values_count;
+			if (sampling || timestamp || values_count >= registry->max_bucket_size.load(std::memory_order_relaxed)) {
 				std::lock_guard<std::mutex> transport_lock{registry->transport_mu};
 				return key.write_unique(values, values_count, count, timestamp);
 			}
-			multivalue_view value{count, values_count, values};
+			multivalue_view value{values_count, values};
 			return registry->update_multivalue_by_key(key, value);
 		}
 	private:
@@ -1093,6 +1095,24 @@ public:
 		}
 		metrics_logging_enabled.store(enabled, std::memory_order_relaxed);
 		return true;
+	}
+	struct Stats : TransportUDPBase::Stats {
+		size_t queue_size;
+		size_t freelist_size;
+		size_t bucket_count;
+	};
+	Stats get_stats() const {
+		Stats res;
+		res.queue_size = stat.queue_size.load(std::memory_order_relaxed);
+		res.freelist_size = stat.freelist_size.load(std::memory_order_relaxed);
+		res.bucket_count = stat.bucket_count.load(std::memory_order_relaxed);
+		std::lock_guard<std::mutex> transport_lock{transport_mu};
+		static_cast<TransportUDPBase::Stats&>(res) = transport.get_stats();
+		return res;
+	}
+	void clear_stats() {
+		std::lock_guard<std::mutex> transport_lock{transport_mu};
+		transport.clear_stats();
 	}
 	class Clock {
 	public:
@@ -1159,6 +1179,7 @@ private:
 				// assert(value.empty())
 			}
 			queue_size = queue.size();
+			stat.queue_size.store(queue_size, std::memory_order_relaxed);
 		}
 		if (incremental_flush_disabled) {
 			return true;
@@ -1180,27 +1201,25 @@ private:
 		{
 			std::lock_guard<std::mutex> lock{mu};
 			now = time_now();
-			for (; count < size && !queue.empty() && queue.front()->timestamp <= timestamp;) {
+			// process no more item than initial queue size
+			// as long as there is room in destination buffer
+			for (auto n = queue.size(); n != 0 && count < size && queue.front()->timestamp <= timestamp; --n) {
 				auto &ptr = queue.front();
-				auto keep = false;
 				{
 					std::lock_guard<std::mutex> bucket_lock{ptr->mu};
 					if (!ptr->value.empty()) {
 						buffer[count] = alloc_bucket(ptr->key, ptr->timestamp);
 						std::swap(buffer[count]->value, ptr->value);
-						if (ptr->regular != 0 && buffer[count]->value.values.size() != 0) {
+						if (ptr->regular != 0 && !buffer[count]->value.values.empty()) {
 							buffer[count]->regular = 1;
 							ptr->value.values.push_back(buffer[count]->value.values.back());
-							ptr->value.count = 1;
 						}
 						++count;
-						keep = true;
 					}
 				}
 				// pop front
-				if (keep || ptr.use_count() > 2) {
-					// either there are clients holding bucket reference
-					// or bucket was written recently, move bucket back
+				if (ptr.use_count() > 2) {
+					// there are clients holding bucket reference, keep bucket in queue
 					ptr->timestamp = now;
 					queue.push_back(std::move(ptr));
 					queue.back()->queue_ptr = &queue.back();
@@ -1209,11 +1228,14 @@ private:
 					if (ptr->queue_ptr) {
 						ptr->queue_ptr = nullptr;
 						buckets.erase(string_view{ptr->key.buffer, ptr->key.buffer_pos});
+						stat.bucket_count.store(buckets.size(), std::memory_order_relaxed);
 					}
 					// unused bucket goes into freelist
 					freelist.emplace_back(std::move(ptr));
+					stat.freelist_size.store(freelist.size(), std::memory_order_relaxed);
 				}
 				queue.pop_front();
+				stat.queue_size.store(queue.size(), std::memory_order_relaxed);
 			}
 		}
 		for (size_t i = 0; i < count; ++i) {
@@ -1222,13 +1244,13 @@ private:
 				std::lock_guard<std::mutex> transport_lock{transport_mu};
 				auto &v = ptr->value;
 				if (!v.values.empty()) {
-					ptr->key.write_values(v.values.data(), v.values.size(), v.count, ptr->timestamp);
+					ptr->key.write_values(v.values.data(), v.values.size(), 0, ptr->timestamp);
 				} else if (!v.unique.empty()) {
-					ptr->key.write_unique(v.unique.data(), v.unique.size(), v.count, ptr->timestamp);
+					ptr->key.write_unique(v.unique.data(), v.unique.size(), 0, ptr->timestamp);
 				} else if (v.count != 0) {
 					ptr->key.write_count(v.count, ptr->timestamp);
 				}
-				if (ptr->regular != 0 && ptr->value.values.size() != 0) {
+				if (ptr->regular != 0 && !ptr->value.values.empty()) {
 					for (auto lag = 0; lag < REGULAR_MEASUREMENT_MAX_LAG_SECONDS && ++ptr->timestamp < now; ++lag) {
 						ptr->key.write_value(v.values.back(), ptr->timestamp);
 					}
@@ -1236,6 +1258,7 @@ private:
 			}
 			std::lock_guard<std::mutex> lock{mu};
 			freelist.emplace_back(std::move(ptr));
+			stat.freelist_size.store(freelist.size(), std::memory_order_relaxed);
 		}
 		return count == size;
 	}
@@ -1248,6 +1271,8 @@ private:
 		auto ptr = alloc_bucket(key, timestamp ? timestamp : time_now());
 		queue.emplace_back(buckets.emplace(string_view{ptr->key.buffer, ptr->key.buffer_pos}, ptr).first->second);
 		ptr->queue_ptr = &queue.back();
+		stat.queue_size.store(queue.size(), std::memory_order_relaxed);
+		stat.bucket_count.store(buckets.size(), std::memory_order_relaxed);
 		return ptr;
 	}
 	std::shared_ptr<bucket> alloc_bucket(const TransportUDP::MetricBuilder &key, uint32_t timestamp) {
@@ -1263,6 +1288,7 @@ private:
 		ptr->value.unique.clear();
 		ptr->queue_ptr = nullptr;
 		freelist.pop_back();
+		stat.freelist_size.store(freelist.size(), std::memory_order_relaxed);
 		return ptr;
 	}
 	uint32_t time_now() const {
@@ -1404,8 +1430,13 @@ private:
 				   !std::memcmp(a.data(), b.data(), a.size());
 		}
 	};
+	struct statistics {
+		std::atomic<size_t> queue_size;
+		std::atomic<size_t> freelist_size;
+		std::atomic<size_t> bucket_count;
+	};
 	std::mutex mu;
-	std::mutex transport_mu;
+	mutable std::mutex transport_mu;
 	std::atomic<size_t> max_bucket_size;
 	std::atomic<uint32_t> time_external;
 	std::atomic_bool metrics_logging_enabled;
@@ -1415,6 +1446,7 @@ private:
 	std::deque<std::shared_ptr<bucket>> queue;
 	std::vector<std::shared_ptr<bucket>> freelist;
 	std::unordered_map<string_view, std::shared_ptr<bucket>, string_view_hash, string_view_equal> buckets;
+	statistics stat{};
 };
 
 } // namespace statshouse
