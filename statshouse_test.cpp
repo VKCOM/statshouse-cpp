@@ -253,16 +253,20 @@ void benchmark_multithread_registry() {
 void send_regular() {
     Registry t;
     t.disable_incremental_flush();
-    auto m = t.metric("malpinskiy_investigation")
-            .tag("a976207097145020")
-            .tag("a058992634786402")
-            .tag("a361387731010001")
-            .tag("a057341188320915")
-            .tag("a913170170684600")
-            .tag("a268289295741267")
-            .tag("a704131134786936")
-            .value_ref();;
-    m.set_value(1);
+    std::vector<Registry::MetricValueRef> v;
+    for (auto i = 0; i < 20; ++i) {
+        auto m = t.metric("malpinskiy_investigation" + std::to_string(i))
+                .tag("a976207097145020")
+                .tag("a058992634786402")
+                .tag("a361387731010001")
+                .tag("a057341188320915")
+                .tag("a913170170684600")
+                .tag("a268289295741267")
+                .tag("a704131134786936")
+                .value_ref();
+        m.set_value(i);
+        v.push_back(std::move(m));
+    }
     for (;;) {
         std::this_thread::sleep_until(std::chrono::time_point_cast<std::chrono::seconds>(
             std::chrono::system_clock::now()) + std::chrono::seconds{1});
