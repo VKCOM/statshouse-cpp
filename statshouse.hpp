@@ -20,19 +20,20 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cinttypes> // PRIu32, PRIu64
+#include <cstdarg>   // va_list, va_start, va_end
+#include <cstdio>    // vsnprintf
 #include <cstring>
 #include <ctime>
 #include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
-#include <cstdio>    // vsnprintf
-#include <cstdarg>   // va_list, va_start, va_end
-#include <cinttypes> // PRIu32, PRIu64
 
 // Use #ifdefs to include headers for various platforms here
 #ifdef _WIN32
@@ -131,6 +132,12 @@ static inline uint64_t wyhash(const void *key, size_t len, uint64_t seed, const 
 
 //the default secret parameters
 static const uint64_t _wyp[4] = {0xa0761d6478bd642full, 0xe7037ed1a0b428dbull, 0x8ebc6af09c88c6e3ull, 0x589965cc75374cc3ull};
+
+//The wyrand PRNG that pass BigCrush and PractRand
+static inline uint64_t wyrand(uint64_t *seed){ *seed+=0xa0761d6478bd642full; return _wymix(*seed,*seed^0xe7037ed1a0b428dbull);}
+
+//fast range integer random number generation on [0,k) credit to Daniel Lemire
+static inline uint64_t wy2u0k(uint64_t r, uint64_t k){ _wymum(&r,&k); return k; }
 
 } // namespace wyhash
 
@@ -810,11 +817,13 @@ public:
 		size_t max_bucket_size{DEFAULT_MAX_BUCKET_SIZE};
 		std::function<int (const char *)> logger;
 		bool incremental_flush_disabled{false};
+		bool sampling_disabled{false};
 	};
 	explicit Registry(const options &o)
 		: max_bucket_size{o.max_bucket_size}
 		, time_external{0}
 		, metrics_logging_enabled{false}
+		, sampling_disabled{o.sampling_disabled}
 		, logger{o.logger}
 		, incremental_flush_disabled{o.incremental_flush_disabled}
 		, transport{o.host, o.port} {
@@ -832,6 +841,7 @@ public:
 		: max_bucket_size{DEFAULT_MAX_BUCKET_SIZE}
 		, time_external{0}
 		, metrics_logging_enabled{false}
+		, sampling_disabled{false}
 		, incremental_flush_disabled{false}
 		, transport{host, port} {
 	}
@@ -870,34 +880,54 @@ private:
 		const double *values;
 		const uint64_t *unique;
 	};
+	struct PRNG {
+		size_t next(size_t k) { // returns random number in [0,k)
+			auto r = wyhash::wyrand(&seed);
+			return static_cast<size_t>(wyhash::wy2u0k(r, static_cast<uint64_t>(k)));
+		}
+		uint64_t seed{static_cast<uint64_t>(std::random_device{}())};
+	};
 	struct multivalue {
-		void write(multivalue_view &src, size_t limit) {
+		void write(multivalue_view &src, Registry *r, PRNG *rand) {
 			if (src.values) {
-				write(values, src.values, src.values_count, limit);
+				write(values, src.values, src.values_count, r, rand);
 			} else if (src.unique) {
-				write(unique, src.unique, src.values_count, limit);
+				write(unique, src.unique, src.values_count, r, rand);
 			} else {
 				count += src.count;
 				src.count = 0;
 			}
 		}
 		template <typename T>
-		void write(std::vector<T> &dst, const T * &src, size_t &src_size, size_t limit) {
-			if (!src_size || limit <= dst.size()) {
+		void write(std::vector<T> &dst, const T * &src, size_t &src_size, Registry *r, PRNG *rand) {
+			if (!src_size) {
 				return;
 			}
-			auto n = (std::min)(src_size, limit - dst.size());
+			size_t i = 0;
+			size_t limit = r->max_bucket_size.load(std::memory_order_relaxed);
 			dst.reserve(limit); // minimize the number of memory allocations
-			for (size_t i = 0; i < n; ++i) {
-				dst.push_back(src[i]);
+			if (dst.size() < limit) {
+				auto n = (std::min)(src_size, limit - dst.size());
+				for (; i < n; ++i, ++size) {
+					dst.push_back(src[i]);
+				}
 			}
-			src += n;
-			src_size -= n;
+			if (!r->sampling_disabled.load(std::memory_order_relaxed)) {
+				for (; i < src_size; ++i, ++size) {
+					auto j = rand->next(size);
+					if (j < limit) {
+						dst[j] = src[i];
+					}
+				}
+			}
+			src += i;
+			src_size -= i;
 		}
 		bool empty() const {
 			return count == 0 && values.empty() && unique.empty();
 		}
 		double count{};
+		size_t size{};
 		std::vector<double> values;
 		std::vector<uint64_t> unique;
 	};
@@ -907,12 +937,14 @@ private:
 			, timestamp{timestamp}
 			, last_flush_timestamp{0}
 			, regular{0}
+			, rand{}
 			, queue_ptr{nullptr} {
 		}
 		TransportUDP::MetricBuilder key;
 		uint32_t timestamp;
 		uint32_t last_flush_timestamp;
 		int regular;
+		PRNG rand;
 		multivalue value;
 		std::mutex mu;
 		std::shared_ptr<bucket> *queue_ptr;
@@ -1098,6 +1130,9 @@ public:
 		metrics_logging_enabled.store(enabled, std::memory_order_relaxed);
 		return true;
 	}
+	void disable_sampling(bool disabled = true) {
+		sampling_disabled.store(disabled, std::memory_order_relaxed);
+	}
 	struct Stats : TransportUDPBase::Stats {
 		size_t queue_size;
 		size_t freelist_size;
@@ -1152,11 +1187,10 @@ private:
 		return update_multivalue_by_ref(ptr, time_now(), value);
 	}
 	bool update_multivalue_by_ref(const std::shared_ptr<bucket> &ptr, uint32_t timestamp, multivalue_view value) {
-		auto limit = max_bucket_size.load(std::memory_order_relaxed);
 		{
 			std::lock_guard<std::mutex> bucket_lock{ptr->mu};
 			if (timestamp <= ptr->timestamp) {
-				ptr->value.write(value, limit);
+				ptr->value.write(value, this, &ptr->rand);
 				if (value.empty()) {
 					return true; // fast path
 				}
@@ -1177,7 +1211,7 @@ private:
 				std::swap((*ptr->queue_ptr)->value, ptr->value);
 				ptr->timestamp = timestamp;
 				ptr->queue_ptr = &queue.back();
-				ptr->value.write(value, limit);
+				ptr->value.write(value, this, &ptr->rand);
 				// assert(value.empty())
 			}
 			queue_size = queue.size();
@@ -1254,9 +1288,9 @@ private:
 				std::lock_guard<std::mutex> transport_lock{transport_mu};
 				auto &v = ptr->value;
 				if (!v.values.empty()) {
-					ptr->key.write_values(v.values.data(), v.values.size(), 0, ptr->timestamp);
+					ptr->key.write_values(v.values.data(), v.values.size(), v.size, ptr->timestamp);
 				} else if (!v.unique.empty()) {
-					ptr->key.write_unique(v.unique.data(), v.unique.size(), 0, ptr->timestamp);
+					ptr->key.write_unique(v.unique.data(), v.unique.size(), v.size, ptr->timestamp);
 				} else if (v.count != 0) {
 					ptr->key.write_count(v.count, ptr->timestamp);
 				}
@@ -1294,6 +1328,7 @@ private:
 		ptr->timestamp = timestamp;
 		ptr->regular = 0;
 		ptr->value.count = 0;
+		ptr->value.size = 0;
 		ptr->value.values.clear();
 		ptr->value.unique.clear();
 		ptr->queue_ptr = nullptr;
@@ -1450,6 +1485,7 @@ private:
 	std::atomic<size_t> max_bucket_size;
 	std::atomic<uint32_t> time_external;
 	std::atomic_bool metrics_logging_enabled;
+	std::atomic_bool sampling_disabled;
 	std::function<int (const char *)> logger; // "puts" signature
 	bool incremental_flush_disabled;
 	TransportUDP transport;
