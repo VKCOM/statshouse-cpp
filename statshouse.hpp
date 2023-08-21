@@ -906,11 +906,13 @@ private:
 			: key{key}
 			, timestamp{timestamp}
 			, regular{0}
+			, flush_number{0}
 			, queue_ptr{nullptr} {
 		}
 		TransportUDP::MetricBuilder key;
 		uint32_t timestamp;
 		int regular;
+		uint flush_number;
 		multivalue value;
 		std::mutex mu;
 		std::shared_ptr<bucket> *queue_ptr;
@@ -1186,16 +1188,17 @@ private:
 		}
 		// flush at most INCREMENTAL_FLUSH_SIZE buckets, don't flush bucket just added
 		std::array<std::shared_ptr<bucket>, INCREMENTAL_FLUSH_BUCKET_COUNT> buffer;
-		flush_some(buffer.data(), (std::min)(queue_size - 1, buffer.size()));
+		flush_some(buffer.data(), (std::min)(queue_size - 1, buffer.size()), ++flush_number);
 		return true;
 	}
 	void flush(uint32_t timestamp) {
+		auto flush_n = ++flush_number;
 		std::array<std::shared_ptr<bucket>, EXPLICIT_FLUSH_CHUNK_SIZE> buffer;
-		while (flush_some(buffer.data(), buffer.size(), timestamp)) {
+		while (flush_some(buffer.data(), buffer.size(), flush_n, timestamp)) {
 			// pass
 		}
 	}
-	bool flush_some(std::shared_ptr<bucket> *buffer, size_t size, uint32_t timestamp = (std::numeric_limits<uint32_t>::max)()) {
+	bool flush_some(std::shared_ptr<bucket> *buffer, size_t size, uint flush_n, uint32_t timestamp = (std::numeric_limits<uint32_t>::max)()) {
 		size_t count = 0;
 		uint32_t now;
 		{
@@ -1207,13 +1210,14 @@ private:
 				auto &ptr = queue.front();
 				{
 					std::lock_guard<std::mutex> bucket_lock{ptr->mu};
-					if (!ptr->value.empty()) {
+					if (ptr->flush_number != flush_n && !ptr->value.empty()) {
 						buffer[count] = alloc_bucket(ptr->key, ptr->timestamp);
 						std::swap(buffer[count]->value, ptr->value);
 						if (ptr->regular != 0 && !buffer[count]->value.values.empty()) {
 							buffer[count]->regular = 1;
 							ptr->value.values.push_back(buffer[count]->value.values.back());
 						}
+						ptr->flush_number = flush_n;
 						++count;
 					}
 				}
@@ -1447,6 +1451,7 @@ private:
 	std::vector<std::shared_ptr<bucket>> freelist;
 	std::unordered_map<string_view, std::shared_ptr<bucket>, string_view_hash, string_view_equal> buckets;
 	statistics stat{};
+	std::atomic_uint flush_number;
 };
 
 } // namespace statshouse
