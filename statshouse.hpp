@@ -246,7 +246,7 @@ public:
 	explicit TransportUDPBase() = default;
 	virtual ~TransportUDPBase() = default;
 
-	void set_default_env(const std::string & env) { // automatically sent as tag '0'
+	void set_default_env(string_view env) { // automatically sent as tag '0'
 		std::lock_guard<mutex> lo(mu);
 		default_env = env;
 		if (default_env.empty()) {
@@ -1085,7 +1085,7 @@ public:
 	void set_max_bucket_size(size_t n) {
 		max_bucket_size.store(n, std::memory_order_relaxed);
 	}
-	void set_default_env(const std::string &env) {
+	void set_default_env(string_view env) {
 		std::lock_guard<std::mutex> transport_lock{transport_mu};
 		transport.set_default_env(env);
 	}
