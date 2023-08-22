@@ -913,8 +913,8 @@ private:
 				}
 			}
 			if (!r->sampling_disabled.load(std::memory_order_relaxed)) {
-				for (; i < src_size; ++i, ++size) {
-					auto j = rand->next(size);
+				for (; i < src_size; ++i) {
+					auto j = rand->next(++size);
 					if (j < limit) {
 						dst[j] = src[i];
 					}
