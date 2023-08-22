@@ -935,12 +935,14 @@ private:
 		bucket(const TransportUDP::MetricBuilder &key, uint32_t timestamp)
 			: key{key}
 			, timestamp{timestamp}
+			, last_flush_timestamp{0}
 			, regular{0}
 			, rand{}
 			, queue_ptr{nullptr} {
 		}
 		TransportUDP::MetricBuilder key;
 		uint32_t timestamp;
+		uint32_t last_flush_timestamp;
 		int regular;
 		PRNG rand;
 		multivalue value;
@@ -1224,31 +1226,39 @@ private:
 		return true;
 	}
 	void flush(uint32_t timestamp) {
+		size_t count_flushed, count_scanned, queue_size;
 		std::array<std::shared_ptr<bucket>, EXPLICIT_FLUSH_CHUNK_SIZE> buffer;
-		while (flush_some(buffer.data(), buffer.size(), timestamp)) {
-			// pass
+		std::tie(count_flushed, count_scanned, queue_size) = flush_some(buffer.data(), buffer.size(), timestamp);
+		for (; count_scanned < queue_size && count_flushed == buffer.size();) {
+			size_t n;
+			std::tie(count_flushed, n, std::ignore) = flush_some(buffer.data(), buffer.size(), timestamp);
+			count_scanned += n;
 		}
 	}
-	bool flush_some(std::shared_ptr<bucket> *buffer, size_t size, uint32_t timestamp = (std::numeric_limits<uint32_t>::max)()) {
-		size_t count = 0;
+	std::tuple<size_t, size_t, size_t> flush_some(std::shared_ptr<bucket> *buffer, size_t size, uint32_t timestamp = (std::numeric_limits<uint32_t>::max)()) {
+		size_t count_flushed = 0;
+		size_t count_scanned = 0;
+		size_t queue_size;
 		uint32_t now;
 		{
 			std::lock_guard<std::mutex> lock{mu};
+			queue_size = queue.size();
 			now = time_now();
 			// process no more item than initial queue size
 			// as long as there is room in destination buffer
-			for (auto n = queue.size(); n != 0 && count < size && queue.front()->timestamp <= timestamp; --n) {
+			for (; count_scanned < queue_size && count_flushed < size && queue.front()->timestamp <= timestamp; ++count_scanned) {
 				auto &ptr = queue.front();
 				{
 					std::lock_guard<std::mutex> bucket_lock{ptr->mu};
-					if (!ptr->value.empty()) {
-						buffer[count] = alloc_bucket(ptr->key, ptr->timestamp);
-						std::swap(buffer[count]->value, ptr->value);
-						if (ptr->regular != 0 && !buffer[count]->value.values.empty()) {
-							buffer[count]->regular = 1;
-							ptr->value.values.push_back(buffer[count]->value.values.back());
+					if (!ptr->value.empty() && (ptr->regular == 0 || ptr->last_flush_timestamp < now)) {
+						buffer[count_flushed] = alloc_bucket(ptr->key, ptr->timestamp);
+						std::swap(buffer[count_flushed]->value, ptr->value);
+						if (ptr->regular != 0 && !buffer[count_flushed]->value.values.empty()) {
+							buffer[count_flushed]->regular = 1;
+							ptr->value.values.push_back(buffer[count_flushed]->value.values.back());
 						}
-						++count;
+						++count_flushed;
+						ptr->last_flush_timestamp = now;
 					}
 				}
 				// pop front
@@ -1272,7 +1282,7 @@ private:
 				stat.queue_size.store(queue.size(), std::memory_order_relaxed);
 			}
 		}
-		for (size_t i = 0; i < count; ++i) {
+		for (size_t i = 0; i < count_flushed; ++i) {
 			auto &ptr = buffer[i];
 			{
 				std::lock_guard<std::mutex> transport_lock{transport_mu};
@@ -1294,7 +1304,7 @@ private:
 			freelist.emplace_back(std::move(ptr));
 			stat.freelist_size.store(freelist.size(), std::memory_order_relaxed);
 		}
-		return count == size;
+		return {count_flushed, count_scanned, queue_size};
 	}
 	std::shared_ptr<bucket> get_or_create_bucket(const TransportUDP::MetricBuilder &key, uint32_t timestamp = 0) {
 		std::lock_guard<std::mutex> lock{mu};
