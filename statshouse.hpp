@@ -1324,6 +1324,8 @@ private:
 			return std::make_shared<bucket>(key, timestamp);
 		}
 		auto ptr = std::move(freelist.back());
+		freelist.pop_back();
+		stat.freelist_size.store(freelist.size(), std::memory_order_relaxed);
 		ptr->key = key;
 		ptr->timestamp = timestamp;
 		ptr->regular = 0;
@@ -1332,8 +1334,6 @@ private:
 		ptr->value.values.clear();
 		ptr->value.unique.clear();
 		ptr->queue_ptr = nullptr;
-		freelist.pop_back();
-		stat.freelist_size.store(freelist.size(), std::memory_order_relaxed);
 		return ptr;
 	}
 	uint32_t time_now() const {
