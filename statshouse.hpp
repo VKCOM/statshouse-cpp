@@ -1018,6 +1018,7 @@ public:
 		MetricValueRef &operator=(const MetricValueRef &other) = delete;
 		MetricValueRef &operator=(MetricValueRef &&other) = default;
 		bool set_value(double value) const {
+			registry->log_values(ptr->key, &value, 1, 0, 0);
 			multivalue_view v{1, &value};
 			return registry->update_multivalue_by_ref(ptr, v);
 		}
