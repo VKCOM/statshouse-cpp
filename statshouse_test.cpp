@@ -205,7 +205,7 @@ void benchmark_best_case<Registry>() {
         .tag("a913170170684600")
         .tag("a268289295741267")
         .tag("a704131134786936")
-        .ref();
+        .event_metric_ref();
     auto begin = std::chrono::steady_clock::now();
     for (auto i = 0; i < 1000000000; i++) {
         m.write_value(1);
@@ -233,7 +233,7 @@ void benchmark_multithread_registry() {
                     .tag("a913170170684600")
                     .tag("a268289295741267")
                     .tag("a704131134786936")
-                    .ref();
+                    .event_metric_ref();
                 std::this_thread::sleep_until(std::chrono::time_point_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now()) + std::chrono::milliseconds{delay});
                 m.write_value(1);
@@ -253,7 +253,7 @@ void benchmark_multithread_registry() {
 void send_regular() {
     Registry t;
     t.disable_incremental_flush();
-    std::vector<Registry::MetricValueRef> v;
+    std::vector<Registry::WaterlevelMetricRef> v;
     for (auto i = 0; i < 20; ++i) {
         auto m = t.metric("malpinskiy_investigation" + std::to_string(i))
                 .tag("a976207097145020")
@@ -263,8 +263,8 @@ void send_regular() {
                 .tag("a913170170684600")
                 .tag("a268289295741267")
                 .tag("a704131134786936")
-                .value_ref();
-        m.set_value(i);
+                .waterlevel_metric_ref();
+        m.set(i);
         v.push_back(std::move(m));
     }
     for (;;) {
@@ -272,6 +272,30 @@ void send_regular() {
             std::chrono::system_clock::now()) + std::chrono::seconds{1});
         t.flush();
     }
+}
+
+void send_waterlevel() {
+    Registry t;
+    auto begin = std::chrono::steady_clock::now();
+    auto ref = t.metric("malpinskiy_investigation")
+            .tag("a976207097145020")
+            .tag("a058992634786402")
+            .tag("a361387731010001")
+            .tag("a057341188320915")
+            .tag("a913170170684600")
+            .tag("a268289295741267")
+            .tag("a704131134786936")
+            .waterlevel_metric_ref();
+    for (auto i = 0; i < 1000000000; i++) {
+            ref.inc();
+    }
+    for (auto i = 0; i < 1000000000; i++) {
+            ref.dec();
+    }
+    t.flush(true);
+    auto end = std::chrono::steady_clock::now();
+    std::printf("TransportUDP elapsed %ld milliseconds\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count());
+    print(t.get_stats());
 }
 
 void registry_logging() {
@@ -307,4 +331,5 @@ int main() {
     // statshouse::test::send_regular();
     // statshouse::test::registry_logging();
     // statshouse::test::benchmark_multithread_registry();
+    // statshouse::test::send_waterlevel();
 }

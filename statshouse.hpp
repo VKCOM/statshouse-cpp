@@ -13,7 +13,7 @@
 
 // should compile without warnings with -Wno-noexcept-type -g -Wall -Wextra -Werror=return-type
 
-#define STATSHOUSE_TRANSPORT_VERSION "2023-06-14"
+#define STATSHOUSE_TRANSPORT_VERSION "2023-12-04"
 #define STATSHOUSE_USAGE_METRICS "statshouse_transport_metrics"
 
 #include <algorithm>
@@ -858,19 +858,29 @@ private:
 			: count{count}
 			, values_count{0}
 			, values{nullptr}
-			, unique{nullptr} {
+			, unique{nullptr}
+			, increment{false} {
 		}
 		multivalue_view(size_t values_count, const double *values)
 			: count{0}
 			, values_count{values_count}
 			, values{values}
-			, unique{nullptr} {
+			, unique{nullptr}
+			, increment{false} {
+		}
+		multivalue_view(const double (&values)[2])
+			: count{0}
+			, values_count{2}
+			, values{values}
+			, unique{nullptr}
+			, increment{true} {
 		}
 		multivalue_view(size_t values_count, const uint64_t *unique)
 			: count{0}
 			, values_count{values_count}
 			, values{nullptr}
-			, unique{unique} {
+			, unique{unique}
+			, increment{false} {
 		}
 		size_t empty() const {
 			return count == 0 && !values_count;
@@ -879,6 +889,7 @@ private:
 		size_t values_count;
 		const double *values;
 		const uint64_t *unique;
+		bool increment; // if set then "values" contain two items [initial_value, delta]
 	};
 	struct PRNG {
 		size_t next(size_t k) { // returns random number in [0,k)
@@ -887,19 +898,35 @@ private:
 		}
 		uint64_t seed{static_cast<uint64_t>(std::random_device{}())};
 	};
+	struct bucket;
 	struct multivalue {
-		void write(multivalue_view &src, Registry *r, PRNG *rand) {
+		void write(multivalue_view &src, Registry *r, bucket *b) {
 			if (src.values) {
-				write(values, src.values, src.values_count, r, rand);
+				if (b->waterlevel != 0) {
+					if (values.empty()) {
+						values.push_back(src.increment
+							? src.values[0] + src.values[1]
+							: src.values[src.values_count - 1]);
+						size = 1;
+					} else {
+						values.back() = src.increment
+							? values.back() + src.values[1]
+							: src.values[src.values_count - 1];
+					}
+					src.values += src.values_count;
+					src.values_count = 0;
+				} else {
+					write(values, src.values, src.values_count, r, b);
+				}
 			} else if (src.unique) {
-				write(unique, src.unique, src.values_count, r, rand);
+				write(unique, src.unique, src.values_count, r, b);
 			} else {
 				count += src.count;
 				src.count = 0;
 			}
 		}
 		template <typename T>
-		void write(std::vector<T> &dst, const T * &src, size_t &src_size, Registry *r, PRNG *rand) {
+		void write(std::vector<T> &dst, const T * &src, size_t &src_size, Registry *r, bucket *b) {
 			if (!src_size) {
 				return;
 			}
@@ -914,7 +941,7 @@ private:
 			}
 			if (!r->sampling_disabled.load(std::memory_order_relaxed)) {
 				for (; i < src_size; ++i) {
-					auto j = rand->next(++size);
+					auto j = b->rand.next(++size);
 					if (j < limit) {
 						dst[j] = src[i];
 					}
@@ -936,26 +963,76 @@ private:
 			: key{key}
 			, timestamp{timestamp}
 			, last_flush_timestamp{0}
-			, regular{0}
+			, waterlevel{0}
 			, rand{}
 			, queue_ptr{nullptr} {
 		}
 		TransportUDP::MetricBuilder key;
 		uint32_t timestamp;
 		uint32_t last_flush_timestamp;
-		int regular;
+		int waterlevel;
 		PRNG rand;
 		multivalue value;
 		std::mutex mu;
 		std::shared_ptr<bucket> *queue_ptr;
 	};
-public:
-	class MetricRef {
-	public:
-		MetricRef(Registry *registry, const TransportUDP::MetricBuilder &key)
+	struct bucket_ref {
+		bucket_ref()
+			: registry{nullptr} {
+		}
+		bucket_ref(Registry *registry, const TransportUDP::MetricBuilder &key)
 			: registry{registry}
 			, ptr{registry->get_or_create_bucket(key)} {
 		}
+		Registry *registry;
+		std::shared_ptr<bucket> ptr;
+	};
+	struct bucket_waterlevel_ref : bucket_ref {
+		bucket_waterlevel_ref() = default;
+		bucket_waterlevel_ref(Registry *registry, const TransportUDP::MetricBuilder &key)
+			: bucket_ref{registry, key} {
+			init();
+		}
+		~bucket_waterlevel_ref() {
+			if (!ptr) {
+				// might be null after move constructor/assignment
+				return;
+			}
+			auto n = 0;
+			{
+				std::lock_guard<std::mutex> bucket_lock{ptr->mu};
+				n = --ptr->waterlevel;
+			}
+			if (n < 0) {
+				registry->log_error("unexpected waterlevel bucket reference count value %d", n);
+			}
+		}
+		bucket_waterlevel_ref(const bucket_waterlevel_ref &other)
+			: bucket_ref{other} {
+			if (ptr) {
+				init();
+			}
+		}
+		bucket_waterlevel_ref &operator=(bucket_waterlevel_ref other) {
+			std::swap(registry, other.registry);
+			std::swap(ptr, other.ptr);
+			return *this;
+
+		}
+		bucket_waterlevel_ref(bucket_waterlevel_ref &&other) = default;
+		bucket_waterlevel_ref &operator=(bucket_waterlevel_ref &&other) = default;
+		void init() {
+			std::lock_guard<std::mutex> bucket_lock{ptr->mu};
+			++ptr->waterlevel;
+		}
+	};
+public:
+	struct EventCountMetricRef : private bucket_ref {
+		EventCountMetricRef() = default;
+		EventCountMetricRef(Registry *registry, const TransportUDP::MetricBuilder &key)
+			: bucket_ref{registry, key} {
+		}
+		explicit operator bool() const { return ptr.get() != nullptr; }
 		bool write_count(double count, uint32_t timestamp = 0) const {
 			registry->log_count(ptr->key, count, timestamp);
 			if (timestamp) {
@@ -965,6 +1042,13 @@ public:
 			multivalue_view value{count};
 			return registry->update_multivalue_by_ref(ptr, value);
 		}
+	};
+	struct EventMetricRef : private bucket_ref {
+		EventMetricRef() = default;
+		EventMetricRef(Registry *registry, const TransportUDP::MetricBuilder &key)
+			: bucket_ref{registry, key} {
+		}
+		explicit operator bool() const { return ptr.get() != nullptr; }
 		bool write_value(double value, uint32_t timestamp = 0) const {
 			return write_values(&value, 1, 1, timestamp);
 		}
@@ -978,6 +1062,13 @@ public:
 			multivalue_view value{values_count, values};
 			return registry->update_multivalue_by_ref(ptr, value);
 		}
+	};
+	struct UniqueMetricRef : private bucket_ref {
+		UniqueMetricRef() = default;
+		UniqueMetricRef(Registry *registry, const TransportUDP::MetricBuilder &key)
+			: bucket_ref{registry, key} {
+		}
+		explicit operator bool() const { return ptr.get() != nullptr; }
 		bool write_unique(uint64_t value, uint32_t timestamp = 0) const {
 			return write_unique(&value, 1, 1, timestamp);
 		}
@@ -991,40 +1082,31 @@ public:
 			multivalue_view value{values_count, values};
 			return registry->update_multivalue_by_ref(ptr, value);
 		}
-	private:
-		Registry *registry;
-		std::shared_ptr<bucket> ptr;
 	};
-	class MetricValueRef {
-	public:
-		MetricValueRef(Registry *registry, const TransportUDP::MetricBuilder &key)
-			: registry{registry}
-			, ptr{registry->get_or_create_bucket(key)} {
-			std::lock_guard<std::mutex> bucket_lock{ptr->mu};
-			++ptr->regular;
+	struct WaterlevelMetricRef : private bucket_waterlevel_ref {
+		WaterlevelMetricRef() = default;
+		WaterlevelMetricRef(Registry *registry, const TransportUDP::MetricBuilder &key)
+			: bucket_waterlevel_ref{registry, key} {
 		}
-		~MetricValueRef() {
-			auto n = 0;
-			if (ptr) { // might be null after move constructor/assignment
-				std::lock_guard<std::mutex> bucket_lock{ptr->mu};
-				n = --ptr->regular;
-			}
-			if (n < 0) {
-				registry->log_error("unexpected bucket regular reference count value %d", n);
-			}
+		explicit operator bool() const { return ptr.get() != nullptr; }
+		bool set(double v) const {
+			registry->log_values(ptr->key, &v, 1, 0, 0);
+			return registry->update_multivalue_by_ref(ptr, multivalue_view{1, &v});
 		}
-		MetricValueRef(const MetricValueRef &other) = delete;
-		MetricValueRef(MetricValueRef &&other) = default; // allows return by value from "regular_ref"
-		MetricValueRef &operator=(const MetricValueRef &other) = delete;
-		MetricValueRef &operator=(MetricValueRef &&other) = default;
-		bool set_value(double value) const {
-			registry->log_values(ptr->key, &value, 1, 0, 0);
-			multivalue_view v{1, &value};
-			return registry->update_multivalue_by_ref(ptr, v);
+		bool add(double v, double v0 = 0) const {
+			registry->log_values(ptr->key, &v, 1, 0, 0);
+			double a[2] = {v0, v};
+			return registry->update_multivalue_by_ref(ptr, multivalue_view{a});
 		}
-	private:
-		Registry *registry;
-		std::shared_ptr<bucket> ptr;
+		bool sub(double v, double v0 = 0) const {
+			return add(-v, v0);
+		}
+		bool inc(double v0 = 0) const {
+			return add(1, v0);
+		}
+		bool dec(double v0 = 0) const {
+			return sub(1, v0);
+		}
 	};
 	class MetricBuilder {
 	public:
@@ -1044,11 +1126,17 @@ public:
 			key.tag(a, b);
 			return *this;
 		}
-		MetricRef ref() const {
-			return MetricRef{registry, key};
+		EventCountMetricRef event_count_metric_ref() const {
+			return EventCountMetricRef{registry, key};
 		}
-		MetricValueRef value_ref() const {
-			return MetricValueRef{registry, key};
+		EventMetricRef event_metric_ref() const {
+			return EventMetricRef{registry, key};
+		}
+		UniqueMetricRef unique_metric_ref() const {
+			return UniqueMetricRef{registry, key};
+		}
+		WaterlevelMetricRef waterlevel_metric_ref() const {
+			return WaterlevelMetricRef{registry, key};
 		}
 		bool write_count(double count, uint32_t timestamp = 0) const {
 			registry->log_count(key, count, timestamp);
@@ -1191,7 +1279,7 @@ private:
 		{
 			std::lock_guard<std::mutex> bucket_lock{ptr->mu};
 			if (timestamp <= ptr->timestamp) {
-				ptr->value.write(value, this, &ptr->rand);
+				ptr->value.write(value, this, ptr.get());
 				if (value.empty()) {
 					return true; // fast path
 				}
@@ -1209,11 +1297,15 @@ private:
 			*ptr->queue_ptr = alloc_bucket(ptr->key, ptr->timestamp);
 			{
 				std::lock_guard<std::mutex> bucket_lock{ptr->mu};
-				std::swap((*ptr->queue_ptr)->value, ptr->value);
 				ptr->timestamp = timestamp;
-				ptr->queue_ptr = &queue.back();
-				ptr->value.write(value, this, &ptr->rand);
+				std::swap((*ptr->queue_ptr)->value, ptr->value);
+				if (value.increment && !(*ptr->queue_ptr)->value.values.empty()) {
+					ptr->value.values.push_back((*ptr->queue_ptr)->value.values.back());
+					ptr->value.size = 1;
+				}
+				ptr->value.write(value, this, ptr.get());
 				// assert(value.empty())
+				ptr->queue_ptr = &queue.back();
 			}
 			queue_size = queue.size();
 			stat.queue_size.store(queue_size, std::memory_order_relaxed);
@@ -1251,12 +1343,13 @@ private:
 				auto &ptr = queue.front();
 				{
 					std::lock_guard<std::mutex> bucket_lock{ptr->mu};
-					if (!ptr->value.empty() && (ptr->regular == 0 || ptr->last_flush_timestamp < now)) {
+					if (!ptr->value.empty() && (ptr->waterlevel == 0 || ptr->last_flush_timestamp < now)) {
 						buffer[count_flushed] = alloc_bucket(ptr->key, ptr->timestamp);
 						std::swap(buffer[count_flushed]->value, ptr->value);
-						if (ptr->regular != 0 && !buffer[count_flushed]->value.values.empty()) {
-							buffer[count_flushed]->regular = 1;
+						if (ptr->waterlevel != 0 && !buffer[count_flushed]->value.values.empty()) {
+							buffer[count_flushed]->waterlevel = 1;
 							ptr->value.values.push_back(buffer[count_flushed]->value.values.back());
+							ptr->value.size = 1;
 						}
 						++count_flushed;
 						ptr->last_flush_timestamp = now;
@@ -1295,7 +1388,7 @@ private:
 				} else if (v.count != 0) {
 					ptr->key.write_count(v.count, ptr->timestamp);
 				}
-				if (ptr->regular != 0 && !ptr->value.values.empty()) {
+				if (ptr->waterlevel != 0 && !ptr->value.values.empty()) {
 					for (auto lag = 0; lag < REGULAR_MEASUREMENT_MAX_LAG_SECONDS && ++ptr->timestamp < now; ++lag) {
 						ptr->key.write_value(v.values.back(), ptr->timestamp);
 					}
@@ -1329,7 +1422,7 @@ private:
 		stat.freelist_size.store(freelist.size(), std::memory_order_relaxed);
 		ptr->key = key;
 		ptr->timestamp = timestamp;
-		ptr->regular = 0;
+		ptr->waterlevel = 0;
 		ptr->value.count = 0;
 		ptr->value.size = 0;
 		ptr->value.values.clear();
