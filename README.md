@@ -28,7 +28,7 @@ int main() {
         .tag("2", "bar")
         .event_metric_ref();
     for (auto i = 0; i < 100; ++i) { // there were 100 events
-        v.write_value(i+1);           // each with value "i+1" (e.g. request duration)
+        v.write_value(i+1);          // each with value "i+1" (e.g. request duration)
     }
 
     // Write "waterlevel" metric
