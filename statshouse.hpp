@@ -1195,6 +1195,10 @@ public:
 	void flush(bool force = false) {
 		if (force) {
 			flush(time_now());
+			{
+				std::lock_guard<std::mutex> l{transport_mu};
+				transport.flush(true);
+			}
 		} else if (incremental_flush_disabled) {
 			flush(time_now() - 1);
 		} else {
