@@ -882,7 +882,7 @@ private:
 			, unique{unique}
 			, increment{false} {
 		}
-		size_t empty() const {
+		bool empty() const noexcept {
 			return count == 0 && !values_count;
 		}
 		double count;
@@ -950,7 +950,7 @@ private:
 			src += i;
 			src_size -= i;
 		}
-		bool empty() const {
+		bool empty() const noexcept {
 			return count == 0 && values.empty() && unique.empty();
 		}
 		double count{};
