@@ -459,7 +459,7 @@ private:
 				// we add extra key on purpose. statshouse will show receive error "tag 16 does not exist" if we overflow
 		};
 		static_assert(names[MAX_KEYS] != 0, "please add key names to array when increasing MAX_KEYS");
-		if (i > names.size())
+		if (i >= names.size())
 			return 0; // if even more tags added, we do not care, so empty string is good enough.
 		return names[i];
 	}
