@@ -182,8 +182,8 @@ public:
 		MetricBuilder & tag(string_view key, string_view str) {
 			auto begin = buffer + buffer_pos;
 			auto end = buffer + MAX_FULL_KEY_SIZE;
-			if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, key.data(), key.size())))) { did_not_fit = true; return *this; }
-			if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, str.data(), str.size())))) { did_not_fit = true; return *this; }
+			if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, key)))) { did_not_fit = true; return *this; }
+			if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, str)))) { did_not_fit = true; return *this; }
 			buffer_pos = begin - buffer;
 			tags_count++;
 			return *this;
@@ -221,7 +221,7 @@ public:
 			auto begin = buffer + buffer_pos;
 			auto end = buffer + MAX_FULL_KEY_SIZE;
 			if (STATSHOUSE_UNLIKELY(!(begin = pack32(begin, end, get_tag_name_tl(i)))))               { did_not_fit = true; return *this; }
-			if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, str.data(), str.size())))) { did_not_fit = true; return *this; }
+			if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, str)))) { did_not_fit = true; return *this; }
 			buffer_pos = begin - buffer;
 			tags_count++;
 			return *this;
@@ -236,7 +236,7 @@ public:
 			static_assert(MAX_FULL_KEY_SIZE > 4 + TL_MAX_TINY_STRING_LEN + 4, "not enough space to not overflow in constructor");
 			auto begin = buffer + buffer_pos;
 			auto end = buffer + MAX_FULL_KEY_SIZE;
-			begin = pack_string(begin, end, m.data(), m.size());
+			begin = pack_string(begin, end, m);
 			begin = pack32(begin, end, 0); // place for tags_count. Never updated in buffer and always stays 0,
 			buffer_pos = begin - buffer;
 		}
@@ -266,7 +266,7 @@ public:
 		auto end = begin + default_env_tl_pair.size();
 
 		begin = pack32(begin, end, pack_key_name(0));
-		begin = pack_string(begin, end, default_env.data(), default_env.size());
+		begin = pack_string(begin, end, default_env);
 
 		default_env_tl_pair.resize(begin - &default_env_tl_pair[0]);
 	}
@@ -463,27 +463,30 @@ private:
 			return 0; // if even more tags added, we do not care, so empty string is good enough.
 		return names[i];
 	}
-	static char * pack_string(char * begin, const char * end, const char * str, size_t len) {
+	static char *pack_string(char *begin, const char *end, string_view str) {
+		size_t len = str.size();
+		const char *data = str.data();
+
 		if (STATSHOUSE_UNLIKELY(len > TL_MAX_TINY_STRING_LEN)) {
 			if (STATSHOUSE_UNLIKELY(len > TL_BIG_STRING_LEN)) {
 				len = TL_BIG_STRING_LEN;
 			}
-			auto fullLen = (4 + len + 3) & ~3;
+			const size_t fullLen = (4 + len + 3) & ~3;
 			if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, fullLen))) {
 				return nullptr;
 			}
 			put32(begin + fullLen - 4, 0); // padding first
 			put32(begin, (len << 8U) | TL_BIG_STRING_MARKER);
-			std::memcpy(begin+4, str, len);
+			std::memcpy(begin+4, data, len);
 			begin += fullLen;
 		} else {
-			auto fullLen = (1 + len + 3) & ~3;
+			const size_t fullLen = (1 + len + 3) & ~3;
 			if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, fullLen))) {
 				return nullptr;
 			}
 			put32(begin + fullLen - 4, 0); // padding first
 			*begin = static_cast<char>(len); // or put32(p, len);
-			std::memcpy(begin+1, str, len);
+			std::memcpy(begin+1, data, len);
 			begin += fullLen;
 		}
 		return begin;
