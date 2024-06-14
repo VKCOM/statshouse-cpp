@@ -406,9 +406,9 @@ private:
 		buf[7] = char(val >> 56);
 	}
 	static bool enoughSpace(const char * begin, const char * end, size_t req) { return begin + req <= end; }
-	static char * pack32(char * begin, const char  * end, size_t v) {
+	static char *pack32(char *begin, const char *end, uint32_t v) {
 		if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, 4))) { return nullptr; }
-		put32(begin, uint32_t(v));
+		put32(begin, v);
 		return begin + 4;
 	}
 	static char * pack64(char * begin, const char * end, uint64_t v) {
