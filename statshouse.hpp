@@ -342,12 +342,12 @@ public:
 	// status "ok" is written always, error statuses only if corresponding counter != 0
 	bool write_usage_metrics(string_view project, string_view cluster) {
 		std::lock_guard<mutex> lo(mu);
-		auto result = true;
-		result = write_usage_metric_impl(project, cluster, "ok",                     &stats.metrics_sent    , true ) && result;
-		result = write_usage_metric_impl(project, cluster, "err_sendto_would_block", &stats.metrics_overflow, false) && result;
-		result = write_usage_metric_impl(project, cluster, "err_sendto_other",       &stats.metrics_failed  , false) && result;
-		result = write_usage_metric_impl(project, cluster, "err_odd_kv",             &stats.metrics_odd_kv  , false) && result;
-		result = write_usage_metric_impl(project, cluster, "err_header_too_big",     &stats.metrics_too_big , false) && result;
+		bool result = true;
+		result &= write_usage_metric_impl(project, cluster, "ok",                     &stats.metrics_sent    , true );
+		result &= write_usage_metric_impl(project, cluster, "err_sendto_would_block", &stats.metrics_overflow, false);
+		result &= write_usage_metric_impl(project, cluster, "err_sendto_other",       &stats.metrics_failed  , false);
+		result &= write_usage_metric_impl(project, cluster, "err_odd_kv",             &stats.metrics_odd_kv  , false);
+		result &= write_usage_metric_impl(project, cluster, "err_header_too_big",     &stats.metrics_too_big , false);
 		return result;
 	}
 
