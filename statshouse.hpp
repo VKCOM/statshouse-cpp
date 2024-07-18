@@ -1304,8 +1304,10 @@ private:
 			*ptr->queue_ptr = alloc_bucket(ptr->key, ptr->timestamp);
 			{
 				std::lock_guard<std::mutex> bucket_lock{ptr->mu};
+				if (ptr->waterlevel == 0 || ptr->last_flush_timestamp < ptr->timestamp) {
+					std::swap((*ptr->queue_ptr)->value, ptr->value);
+				}
 				ptr->timestamp = timestamp;
-				std::swap((*ptr->queue_ptr)->value, ptr->value);
 				if (value.increment && !(*ptr->queue_ptr)->value.values.empty()) {
 					ptr->value.values.push_back((*ptr->queue_ptr)->value.values.back());
 					ptr->value.size = 1;
@@ -1353,13 +1355,15 @@ private:
 					if (!ptr->value.empty() && (ptr->waterlevel == 0 || ptr->last_flush_timestamp < now)) {
 						buffer[count_flushed] = alloc_bucket(ptr->key, ptr->timestamp);
 						std::swap(buffer[count_flushed]->value, ptr->value);
-						if (ptr->waterlevel != 0 && !buffer[count_flushed]->value.values.empty()) {
-							buffer[count_flushed]->waterlevel = 1;
-							ptr->value.values.push_back(buffer[count_flushed]->value.values.back());
-							ptr->value.size = 1;
+						if (ptr->waterlevel != 0) {
+							if (!buffer[count_flushed]->value.values.empty()) {
+								buffer[count_flushed]->waterlevel = 1;
+								ptr->value.values.push_back(buffer[count_flushed]->value.values.back());
+								ptr->value.size = 1;
+							}
+							ptr->last_flush_timestamp = now;
 						}
 						++count_flushed;
-						ptr->last_flush_timestamp = now;
 					}
 				}
 				// pop front
