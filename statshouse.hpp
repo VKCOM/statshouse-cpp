@@ -486,7 +486,9 @@ private:
 			}
 			put32(begin + fullLen - 4, 0); // padding first
 			*begin = static_cast<char>(len); // or put32(p, len);
-			std::memcpy(begin+1, data, len);
+			if (STATSHOUSE_LIKELY(len != 0)) { // avoid calling std::memcpy(..., __restrict__ src = nullptr, ...) for empty string_view
+				std::memcpy(begin+1, data, len);
+			}
 			begin += fullLen;
 		}
 		return begin;
