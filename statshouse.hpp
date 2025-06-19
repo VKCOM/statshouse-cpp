@@ -161,7 +161,7 @@ public:
 		SAFE_DATAGRAM_SIZE    = 508,   // https://stackoverflow.com/questions/1098897/what-is-the-largest-safe-udp-packet-size-on-the-internet
 		DEFAULT_DATAGRAM_SIZE = 1232,
 		MAX_DATAGRAM_SIZE     = 65507, // https://stackoverflow.com/questions/42609561/udp-maximum-packet-size/42610200
-		MAX_KEYS              = 16,
+		MAX_KEYS              = 47,
 		MAX_FULL_KEY_SIZE     = 1024, // roughly metric plus all tags
 	};
 
@@ -438,7 +438,7 @@ private:
 		return (i < 10) ? (1 | (uint32_t('0' + i) << 8)) : (2 | (uint32_t('0' + i/10) << 8) | (uint32_t('0' + i%10) << 16));
 	}
 	static uint32_t get_tag_name_tl(size_t i) {
-		static constexpr std::array<uint32_t, MAX_KEYS + 1> names{
+		static constexpr std::array<uint32_t, MAX_KEYS> names{
 				pack_key_name(0),
 				pack_key_name(1),
 				pack_key_name(2),
@@ -456,9 +456,38 @@ private:
 				pack_key_name(14),
 				pack_key_name(15),
 				pack_key_name(16),
-				// we add extra key on purpose. statshouse will show receive error "tag 16 does not exist" if we overflow
+				pack_key_name(17),
+				pack_key_name(18),
+				pack_key_name(19),
+				pack_key_name(20),
+				pack_key_name(21),
+				pack_key_name(22),
+				pack_key_name(23),
+				pack_key_name(24),
+				pack_key_name(25),
+				pack_key_name(26),
+				pack_key_name(27),
+				pack_key_name(28),
+				pack_key_name(29),
+				pack_key_name(30),
+				pack_key_name(31),
+				pack_key_name(32),
+				pack_key_name(33),
+				pack_key_name(34),
+				pack_key_name(35),
+				pack_key_name(36),
+				pack_key_name(37),
+				pack_key_name(38),
+				pack_key_name(39),
+				pack_key_name(40),
+				pack_key_name(41),
+				pack_key_name(42),
+				pack_key_name(43),
+				pack_key_name(44),
+				pack_key_name(45),
+				pack_key_name(46),
 		};
-		static_assert(names[MAX_KEYS] != 0, "please add key names to array when increasing MAX_KEYS");
+		static_assert(names[MAX_KEYS - 1] != 0, "please add key names to array when increasing MAX_KEYS");
 		if (i >= names.size())
 			return 0; // if even more tags added, we do not care, so empty string is good enough.
 		return names[i];
