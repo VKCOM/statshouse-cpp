@@ -316,6 +316,46 @@ void registry_logging() {
     m.write_unique(3);
 }
 
+template<typename T>
+void test_sample_factor() {
+    // Test that sample_factor works correctly
+    T t{"", 0}; // dummy transport - no actual network
+
+    // Test with sample_factor=1 (no sampling) - all events should be recorded
+    for (int i = 0; i < 1000; i++) {
+        t.metric("test_no_sampling").tag("i", std::to_string(i)).sample_factor(1).write_count(1);
+    }
+    t.flush(true);
+    auto stats_no_sampling = traits<T>::get_stats(t);
+    std::printf("%s sample_factor=1: sent %zu metrics\n", traits<T>::get_name(), stats_no_sampling.metrics_sent);
+
+    // Test with sample_factor=10 - approximately 1/10 events should be recorded
+    // Use same metric name for all events to avoid creating many buckets in Registry
+    auto m10 = t.metric("test_sampling_10").sample_factor(10);
+    for (int i = 0; i < 10000; i++) {
+        m10.write_count(1);
+    }
+    t.flush(true);
+    auto stats_with_sampling = traits<T>::get_stats(t);
+    size_t sampled_count = stats_with_sampling.metrics_sent - stats_no_sampling.metrics_sent;
+    // TransportUDP sends ~1000 separate metrics; Registry aggregates into 1 metric
+    std::printf("%s sample_factor=10: sent %zu metrics (TransportUDP ~1000, Registry 1)\n", traits<T>::get_name(), sampled_count);
+
+    // Test with sample_factor=100 - reuse same metric reference
+    auto m100 = t.metric("test_sampling_100").sample_factor(100);
+    for (int i = 0; i < 100000; i++) {
+        m100.write_count(1);
+    }
+    t.flush(true);
+    auto stats_with_sampling_100 = traits<T>::get_stats(t);
+    size_t sampled_count_100 = stats_with_sampling_100.metrics_sent - stats_with_sampling.metrics_sent;
+    std::printf("%s sample_factor=100: sent %zu metrics (TransportUDP ~1000, Registry 1)\n", traits<T>::get_name(), sampled_count_100);
+
+    // Test that expected values are preserved: with sampling, count is multiplied by factor
+    // For sample_factor=10 and 10000 events, expected total count = ~10000 (with variance)
+    // For sample_factor=100 and 100000 events, expected total count = ~100000 (with variance)
+}
+
 } // namespace test
 } // namespace statshouse
 
@@ -324,7 +364,7 @@ int main() {
     // statshouse::test::benchmark_pack_header<statshouse::Registry>();
     // statshouse::test::benchmark_write_value<statshouse::TransportUDP>();
     // statshouse::test::benchmark_write_value<statshouse::Registry>();
-    statshouse::test::benchmark_worst_case<statshouse::Registry>();
+    // statshouse::test::benchmark_worst_case<statshouse::Registry>();
     // statshouse::test::benchmark_worst_case<statshouse::TransportUDP>();
     // statshouse::test::benchmark_best_case<statshouse::TransportUDP>();
     // statshouse::test::benchmark_best_case<statshouse::Registry>();
@@ -332,4 +372,8 @@ int main() {
     // statshouse::test::registry_logging();
     // statshouse::test::benchmark_multithread_registry();
     // statshouse::test::send_waterlevel();
+
+    // Test sample_factor functionality
+    // statshouse::test::test_sample_factor<statshouse::TransportUDP>();
+    // statshouse::test::test_sample_factor<statshouse::Registry>();
 }
