@@ -1122,7 +1122,9 @@ private:
 	void run_dns_refresh() {
 		while (!stop_.load()) {
 			std::unique_lock<std::mutex> lock{dns_mu_};
-			dns_cv_.wait_for(lock, std::chrono::minutes(1), [this]() { return stop_.load(); });
+			// Avoid wait_for to support older glibc versions without pthread_cond_clockwait.
+			dns_cv_.wait_until(lock, std::chrono::system_clock::now() + std::chrono::minutes(1),
+			                     [this]() { return stop_.load(); });
 			if (stop_.load()) {
 				break;
 			}
