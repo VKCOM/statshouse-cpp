@@ -180,6 +180,7 @@ public:
 		MAX_DATAGRAM_SIZE     = 65507, // https://stackoverflow.com/questions/42609561/udp-maximum-packet-size/42610200
 		MAX_KEYS              = 47,
 		MAX_FULL_KEY_SIZE     = 1024, // roughly metric plus all tags
+		MAX_HOST_TAG_LEN      = 128,
 	};
 
 	// Metric name builder. Use by calling transport.metric("metric").tag("tag1").tag("tag2").write_count(1);
@@ -197,9 +198,6 @@ public:
 		}
 		// Assigns arbitrary tag value by key name
 		MetricBuilder & tag(string_view key, string_view str) {
-			if (key.size() == 2 && key.data()[0] == '_' && key.data()[1] == 'h') {
-				host_set = true;
-			}
 			auto begin = buffer + buffer_pos;
 			auto end = buffer + MAX_FULL_KEY_SIZE;
 			if (STATSHOUSE_UNLIKELY(!(begin = pack_string(begin, end, key)))) { did_not_fit = true; return *this; }
@@ -262,7 +260,6 @@ public:
 		}
 		TransportUDPBase *transport;
 		bool env_set = false; // so current default_env will be added in pack_header even if set later.
-		bool host_set = false; // if explicit _h is set, do not add default hostname tag.
 		bool did_not_fit = false; // we do not want any exceptions in writing metrics
 		size_t next_tag = 1;
 		size_t tags_count = 0;
@@ -276,16 +273,10 @@ public:
 		if (::gethostname(host_buf, sizeof(host_buf) - 1) == 0) {
 			host_buf[sizeof(host_buf) - 1] = '\0';
 			host_tag.assign(host_buf);
+			if (host_tag.size() > MAX_HOST_TAG_LEN) {
+				host_tag.resize(MAX_HOST_TAG_LEN);
+			}
 		}
-		if (host_tag.empty()) {
-			return;
-		}
-		host_tag_tl_pair.resize(4 + host_tag.size() + 4); // key name, host, padding
-		auto begin = &host_tag_tl_pair[0];
-		auto end = begin + host_tag_tl_pair.size();
-		begin = pack32(begin, end, 2 | (uint32_t('_') << 8) | (uint32_t('h') << 16));
-		begin = pack_string(begin, end, host_tag);
-		host_tag_tl_pair.resize(begin - &host_tag_tl_pair[0]);
 	}
 	virtual ~TransportUDPBase() = default;
 
@@ -401,6 +392,7 @@ public:
 protected:
 	Stats stats; // allow implementations to update stats directly for simplicity
 	mutable mutex mu;
+	std::string host_tag;
 	bool write_count_locked(const MetricBuilder &metric, double count, uint32_t tsUnixSec = 0) {
 		return write_count_impl(metric, count, tsUnixSec);
 	}
@@ -430,8 +422,6 @@ private:
 	std::string default_env;
 	std::string default_env_tl_pair; // "0", default_env in TL format to optimized writing
 	std::string app_name;
-	std::string host_tag;
-	std::string host_tag_tl_pair; // "_h", hostname in TL format;
 
 	size_t max_payload_size = DEFAULT_DATAGRAM_SIZE;
 	bool immediate_flush = false;
@@ -616,18 +606,12 @@ private:
 		if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, metric.buffer_pos))) { return nullptr; }
 		std::memcpy(begin, metric.buffer, metric.buffer_pos);
 		const bool add_env = !metric.env_set && !default_env_tl_pair.empty();
-		const bool add_host = !metric.host_set && !host_tag_tl_pair.empty();
-		put32(begin + metric.tags_count_pos(), metric.tags_count + int(add_env) + int(add_host));
+		put32(begin + metric.tags_count_pos(), metric.tags_count + int(add_env));
 		begin += metric.buffer_pos;
 		if (add_env) {
 			if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, default_env_tl_pair.size()))) { return nullptr; }
 			std::memcpy(begin, default_env_tl_pair.data(), default_env_tl_pair.size());
 			begin += default_env_tl_pair.size();
-		}
-		if (add_host) {
-			if (STATSHOUSE_UNLIKELY(!enoughSpace(begin, end, host_tag_tl_pair.size()))) { return nullptr; }
-			std::memcpy(begin, host_tag_tl_pair.data(), host_tag_tl_pair.size());
-			begin += host_tag_tl_pair.size();
 		}
 		if (fields_mask & TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK) {
 			if (STATSHOUSE_UNLIKELY(!(begin = pack64(begin, end, doubleBits(counter))))) { return nullptr;}
@@ -901,7 +885,8 @@ public:
 	TransportTCP(const std::string &host, int port, const std::string &resolve_targets = "")
 		: host_{host}
 		, resolve_targets_{resolve_targets}
-		, port_{port} {
+		, port_{port}
+		, handshake_(build_tcp_handshake_v2(host_tag)) {
 		(void)refresh_pools();
 		primary_worker_.th = std::thread(&TransportTCP::run_worker, this, &primary_worker_);
 		secondary_worker_.th = std::thread(&TransportTCP::run_worker, this, &secondary_worker_);
@@ -938,7 +923,10 @@ public:
 	}
 
 private:
-	enum { tcpConnBucketCount = 512 };
+	enum {
+		tcpConnBucketCount = 512,
+		stuckReconDelaySec = 30,
+	};
 	struct resolved_addr {
 		::sockaddr_storage storage{};
 		socklen_t len = 0;
@@ -952,6 +940,8 @@ private:
 		int sock = -1;
 		std::thread th;
 		std::atomic<size_t> would_block_bytes{0};
+		std::atomic_bool force_reconnect{false};
+		std::chrono::steady_clock::time_point last_stuck_recon{std::chrono::steady_clock::now()};
 	};
 	struct send_result {
 		bool ok = false;
@@ -962,6 +952,7 @@ private:
 	std::string host_;
 	std::string resolve_targets_;
 	int port_ = 0;
+	std::string handshake_; // precomputed reconnect key (statshousev2 + host)
 	worker primary_worker_;
 	worker secondary_worker_;
 	std::mutex route_mu_;
@@ -996,6 +987,11 @@ private:
 			return flush_packet_result::ok;
 		}
 		if (enqueue(*secondary, payload)) {
+			primary->force_reconnect.store(true, std::memory_order_relaxed);
+			{
+				std::lock_guard<std::mutex> lock{primary->mu};
+				primary->cv.notify_one();
+			}
 			std::lock_guard<std::mutex> lock{route_mu_};
 			std::swap(primary_route_, secondary_route_);
 			return flush_packet_result::ok;
@@ -1017,21 +1013,47 @@ private:
 	void run_worker(worker *w) {
 		for (;;) {
 			std::vector<char> payload;
+			bool have_payload = false;
+			bool need_recon = false;
 			{
 				std::unique_lock<std::mutex> lock{w->mu};
-				w->cv.wait(lock, [this, w]() { return stop_.load() || !w->queue.empty(); });
-				if (w->queue.empty() && stop_.load()) {
+				w->cv.wait(lock, [this, w]() {
+					return stop_.load() || !w->queue.empty() || w->force_reconnect.load(std::memory_order_relaxed);
+				});
+				if (w->force_reconnect.exchange(false, std::memory_order_relaxed)) {
+					need_recon = true;
+				}
+				if (!w->queue.empty()) {
+					payload = std::move(w->queue.front());
+					w->queue.pop_front();
+					have_payload = true;
+				} else if (stop_.load()) {
 					break;
 				}
-				payload = std::move(w->queue.front());
-				w->queue.pop_front();
 			}
-			send_payload_with_reconnect(*w, payload);
+			if (need_recon) {
+				maybe_stuck_reconnect(*w);
+			}
+			if (have_payload) {
+				send_payload_with_reconnect(*w, payload);
+			}
 		}
+	}
+
+	void maybe_stuck_reconnect(worker &w) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now < w.last_stuck_recon + std::chrono::seconds(stuckReconDelaySec)) {
+			return;
+		}
+		close_socket(w.sock);
+		w.last_stuck_recon = now;
 	}
 
 	void send_payload_with_reconnect(worker &w, const std::vector<char> &payload) {
 		for (;;) {
+			if (w.force_reconnect.exchange(false, std::memory_order_relaxed)) {
+				maybe_stuck_reconnect(w);
+			}
 			if (w.sock < 0 && !reconnect(w)) {
 				if (stop_.load()) {
 					return;
@@ -1107,8 +1129,7 @@ private:
 			set_errno_error(err, "statshouse::TransportTCP connect() failed");
 			return false;
 		}
-		static const char kHeader[] = "statshousev1";
-		const send_result header_write = send_all(sock, kHeader, sizeof(kHeader) - 1);
+		const send_result header_write = send_all(sock, handshake_.data(), handshake_.size());
 		if (!header_write.ok) {
 			int err = header_write.err;
 			::close(sock);
@@ -1241,8 +1262,25 @@ private:
 		kb.tag("1", "5");  // lang: cpp
 		kb.tag("2", "1");  // kind: would block
 		kb.tag("3", app_name_locked());
+		if (!host_tag.empty()) {
+			kb.tag("_h", host_tag);
+		}
 		const double lost = static_cast<double>(n);
 		(void)write_values_locked(kb, &lost, 1, 0, 0);
+	}
+
+	static std::string build_tcp_handshake_v2(const std::string &host_tag) {
+		std::string buf;
+		buf.reserve(11 + 1 + 4 + host_tag.size());
+		buf.append("statshousev");
+		buf.push_back('2');
+		const uint32_t n = static_cast<uint32_t>(host_tag.size());
+		buf.push_back(static_cast<char>(n));
+		buf.push_back(static_cast<char>(n >> 8));
+		buf.push_back(static_cast<char>(n >> 16));
+		buf.push_back(static_cast<char>(n >> 24));
+		buf.append(host_tag);
+		return buf;
 	}
 
 	void set_errno_error(int err, const char *msg) {
