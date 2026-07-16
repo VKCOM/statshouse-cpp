@@ -180,7 +180,7 @@ public:
 		MAX_DATAGRAM_SIZE     = 65507, // https://stackoverflow.com/questions/42609561/udp-maximum-packet-size/42610200
 		MAX_KEYS              = 47,
 		MAX_FULL_KEY_SIZE     = 1024, // roughly metric plus all tags
-		MAX_HOST_TAG_LEN      = 5,
+		MAX_HOST_TAG_LEN      = 128,
 	};
 
 	// Metric name builder. Use by calling transport.metric("metric").tag("tag1").tag("tag2").write_count(1);
