@@ -1051,9 +1051,6 @@ private:
 
 	void send_payload_with_reconnect(worker &w, const std::vector<char> &payload) {
 		for (;;) {
-			if (w.force_reconnect.exchange(false, std::memory_order_relaxed)) {
-				maybe_stuck_reconnect(w);
-			}
 			if (w.sock < 0 && !reconnect(w)) {
 				if (stop_.load()) {
 					return;
