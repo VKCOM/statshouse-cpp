@@ -940,7 +940,7 @@ private:
 		int sock = -1;
 		std::thread th;
 		std::atomic<size_t> would_block_bytes{0};
-		std::atomic_bool force_reconnect{false};
+		bool force_reconnect = false;
 		std::chrono::steady_clock::time_point last_stuck_recon{std::chrono::steady_clock::now()};
 	};
 	struct send_result {
@@ -987,9 +987,9 @@ private:
 			return flush_packet_result::ok;
 		}
 		if (enqueue(*secondary, payload)) {
-			primary->force_reconnect.store(true, std::memory_order_relaxed);
 			{
 				std::lock_guard<std::mutex> lock{primary->mu};
+				primary->force_reconnect = true;
 				primary->cv.notify_one();
 			}
 			std::lock_guard<std::mutex> lock{route_mu_};
@@ -1018,9 +1018,10 @@ private:
 			{
 				std::unique_lock<std::mutex> lock{w->mu};
 				w->cv.wait(lock, [this, w]() {
-					return stop_.load() || !w->queue.empty() || w->force_reconnect.load(std::memory_order_relaxed);
+					return stop_.load() || !w->queue.empty() || w->force_reconnect;
 				});
-				if (w->force_reconnect.exchange(false, std::memory_order_relaxed)) {
+				if (w->force_reconnect) {
+					w->force_reconnect = false;
 					need_recon = true;
 				}
 				if (!w->queue.empty()) {
@@ -1051,9 +1052,6 @@ private:
 
 	void send_payload_with_reconnect(worker &w, const std::vector<char> &payload) {
 		for (;;) {
-			if (w.force_reconnect.exchange(false, std::memory_order_relaxed)) {
-				maybe_stuck_reconnect(w);
-			}
 			if (w.sock < 0 && !reconnect(w)) {
 				if (stop_.load()) {
 					return;
