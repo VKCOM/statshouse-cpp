@@ -987,9 +987,9 @@ private:
 			return flush_packet_result::ok;
 		}
 		if (enqueue(*secondary, payload)) {
-			primary->force_reconnect.store(true, std::memory_order_relaxed);
 			{
 				std::lock_guard<std::mutex> lock{primary->mu};
+				primary->force_reconnect.store(true, std::memory_order_relaxed);
 				primary->cv.notify_one();
 			}
 			std::lock_guard<std::mutex> lock{route_mu_};
